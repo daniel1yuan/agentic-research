@@ -1,0 +1,39 @@
+# CLI command. Supports args, e.g., "ccs production" or just "claude".
+cli_command: "claude"
+
+# Maximum number of topics to research concurrently
+max_concurrent_topics: 2
+
+# Default timeout per agent invocation in seconds
+agent_timeout: 600
+
+# Default claude model for all agents
+# Aliases: opus, sonnet, haiku. Full names also work (e.g., claude-sonnet-4-6).
+model: "sonnet"
+
+# Default max conversation turns per agent
+max_turns: 25
+
+# Max USD per topic before the pipeline bails. 0 = no limit.
+max_cost_per_topic: 0
+
+# Output directory (relative to project root)
+output_dir: "output"
+
+# Queue file path (relative to project root)
+queue_file: "queue.yaml"
+
+# Per-agent overrides. Synthesis and revision benefit from a stronger model
+# since they need to reason across multiple sources.
+agents:
+  synthesizer:
+    model: "opus"
+  revision:
+    model: "opus"
+
+# All agent names for reference:
+#   research_academic, research_expert, research_general,
+#   synthesizer, validate_bias, validate_sources,
+#   validate_claims, validate_completeness, revision
+#
+# Each supports: model, max_turns, timeout
