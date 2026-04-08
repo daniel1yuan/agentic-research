@@ -2,3 +2,4 @@
 /output
 *.tmp
 queue.yaml
+config.yaml

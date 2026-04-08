@@ -23,8 +23,14 @@ pub async fn run_checks(config: &Config, queue_path: &Path, output_dir: &Path, p
     }
 
     print!("  {} auth working ... ", cli);
-    match agent::test_cli_connectivity(cli).await {
-        Ok(true) => println!("ok"),
+    match agent::test_cli_connectivity(cli, &config.cli_env).await {
+        Ok(true) => {
+            if let Some(status) = agent::get_auth_status(cli, &config.cli_env).await {
+                println!("ok ({status})");
+            } else {
+                println!("ok");
+            }
+        }
         Ok(false) => {
             println!("FAIL");
             println!("    '{}' returned an error. Check your authentication.", cli);

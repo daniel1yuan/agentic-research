@@ -17,6 +17,12 @@ const DEFAULT_CONFIG: &str = "\
 # CLI command. Supports args, e.g., \"ccs production\" or just \"claude\".
 cli_command: \"claude\"
 
+# Environment variables for agent subprocesses.
+# If you use ccs account profiles, set CLAUDE_CONFIG_DIR to route auth:
+#   cli_env:
+#     CLAUDE_CONFIG_DIR: \"/Users/you/.ccs/instances/your-profile\"
+cli_env: {}
+
 # Maximum number of topics to research concurrently
 max_concurrent_topics: 2
 

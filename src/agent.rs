@@ -27,6 +27,7 @@ pub struct AgentResult {
 pub struct AgentConfig {
     pub name: String,
     pub cli_command: String,
+    pub cli_env: std::collections::HashMap<String, String>,
     pub prompt: String,
     pub output_path: PathBuf,
     pub model: String,
@@ -36,10 +37,11 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
-    pub fn research(name: &str, cli_command: &str, prompt: String, output_path: PathBuf, model: &str, max_turns: u32, timeout: u64) -> Self {
+    pub fn research(name: &str, cli_command: &str, cli_env: &std::collections::HashMap<String, String>, prompt: String, output_path: PathBuf, model: &str, max_turns: u32, timeout: u64) -> Self {
         Self {
             name: name.to_string(),
             cli_command: cli_command.to_string(),
+            cli_env: cli_env.clone(),
             prompt,
             output_path,
             model: model.to_string(),
@@ -52,10 +54,11 @@ impl AgentConfig {
         }
     }
 
-    pub fn synthesis(cli_command: &str, prompt: String, output_path: PathBuf, model: &str, max_turns: u32, timeout: u64) -> Self {
+    pub fn synthesis(cli_command: &str, cli_env: &std::collections::HashMap<String, String>, prompt: String, output_path: PathBuf, model: &str, max_turns: u32, timeout: u64) -> Self {
         Self {
             name: "synthesizer".to_string(),
             cli_command: cli_command.to_string(),
+            cli_env: cli_env.clone(),
             prompt,
             output_path,
             model: model.to_string(),
@@ -67,7 +70,7 @@ impl AgentConfig {
         }
     }
 
-    pub fn validator(name: &str, cli_command: &str, prompt: String, output_path: PathBuf, model: &str, max_turns: u32, timeout: u64, needs_web: bool) -> Self {
+    pub fn validator(name: &str, cli_command: &str, cli_env: &std::collections::HashMap<String, String>, prompt: String, output_path: PathBuf, model: &str, max_turns: u32, timeout: u64, needs_web: bool) -> Self {
         let mut tools = vec![
             "Read".into(), "Write".into(), "Glob".into(), "Grep".into(),
         ];
@@ -79,6 +82,7 @@ impl AgentConfig {
         Self {
             name: name.to_string(),
             cli_command: cli_command.to_string(),
+            cli_env: cli_env.clone(),
             prompt,
             output_path,
             model: model.to_string(),
@@ -88,10 +92,11 @@ impl AgentConfig {
         }
     }
 
-    pub fn revision(cli_command: &str, prompt: String, output_path: PathBuf, model: &str, max_turns: u32, timeout: u64) -> Self {
+    pub fn revision(cli_command: &str, cli_env: &std::collections::HashMap<String, String>, prompt: String, output_path: PathBuf, model: &str, max_turns: u32, timeout: u64) -> Self {
         Self {
             name: "revision".to_string(),
             cli_command: cli_command.to_string(),
+            cli_env: cli_env.clone(),
             prompt,
             output_path,
             model: model.to_string(),
@@ -151,6 +156,10 @@ async fn invoke_claude(config: AgentConfig) -> Result<AgentResult> {
         .arg("--allowedTools").arg(&tools_json)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+
+    for (key, val) in &config.cli_env {
+        command.env(key, val);
+    }
 
     if let Some(parent) = config.output_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -258,23 +267,28 @@ pub(crate) fn extract_usage_from_json(stdout: &str) -> Option<AgentUsage> {
     })
 }
 
-pub async fn test_cli_connectivity(cli_command: &str) -> Result<bool> {
+pub async fn test_cli_connectivity(cli_command: &str, cli_env: &std::collections::HashMap<String, String>) -> Result<bool> {
     let parts: Vec<&str> = cli_command.split_whitespace().collect();
     let (bin, prefix_args) = parts.split_first()
         .map(|(b, rest)| (*b, rest))
         .unwrap_or(("claude", &[]));
 
+    let mut cmd = Command::new(bin);
+    cmd.args(prefix_args)
+        .arg("-p")
+        .arg("Respond with exactly: OK")
+        .arg("--output-format").arg("json")
+        .arg("--max-turns").arg("1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    for (key, val) in cli_env {
+        cmd.env(key, val);
+    }
+
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(crate::config::CONNECTIVITY_TIMEOUT_SECS),
-        Command::new(bin)
-            .args(prefix_args)
-            .arg("-p")
-            .arg("Respond with exactly: OK")
-            .arg("--output-format").arg("json")
-            .arg("--max-turns").arg("1")
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output(),
+        cmd.output(),
     )
     .await;
 
@@ -282,6 +296,40 @@ pub async fn test_cli_connectivity(cli_command: &str) -> Result<bool> {
         Err(_) => Ok(false),
         Ok(Err(_)) => Ok(false),
         Ok(Ok(o)) => Ok(o.status.success()),
+    }
+}
+
+pub async fn get_auth_status(cli_command: &str, cli_env: &std::collections::HashMap<String, String>) -> Option<String> {
+    let bin = cli_command.split_whitespace().next().unwrap_or("claude");
+
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("auth").arg("status").arg("--text")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    for (key, val) in cli_env {
+        cmd.env(key, val);
+    }
+
+    let output = cmd.output().ok().filter(|o| o.status.success())?;
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    // parse key fields from "Key: Value" lines
+    let mut org = None;
+    let mut email = None;
+    for line in text.lines() {
+        if let Some(val) = line.strip_prefix("Organization: ") {
+            org = Some(val.trim());
+        } else if let Some(val) = line.strip_prefix("Email: ") {
+            email = Some(val.trim());
+        }
+    }
+
+    match (org, email) {
+        (Some(o), Some(e)) => Some(format!("{e} @ {o}")),
+        (None, Some(e)) => Some(e.to_string()),
+        (Some(o), None) => Some(o.to_string()),
+        (None, None) => Some(text.lines().next().unwrap_or("authenticated").trim().to_string()),
     }
 }
 
@@ -336,7 +384,7 @@ mod tests {
     #[test]
     fn research_config_has_web_tools() {
         let config = AgentConfig::research(
-            "test_agent", "claude", "prompt".into(), PathBuf::from("/tmp/out.md"), "sonnet", 25, 600,
+            "test_agent", "claude", &Default::default(), "prompt".into(), PathBuf::from("/tmp/out.md"), "sonnet", 25, 600,
         );
         assert_eq!(config.name, "test_agent");
         assert!(config.allowed_tools.contains(&"WebSearch".to_string()));
@@ -347,7 +395,7 @@ mod tests {
     #[test]
     fn synthesis_config_has_no_web_tools() {
         let config = AgentConfig::synthesis(
-            "claude", "prompt".into(), PathBuf::from("/tmp/out.md"), "sonnet", 25, 600,
+            "claude", &Default::default(), "prompt".into(), PathBuf::from("/tmp/out.md"), "sonnet", 25, 600,
         );
         assert_eq!(config.name, "synthesizer");
         assert!(!config.allowed_tools.contains(&"WebSearch".to_string()));
@@ -357,10 +405,10 @@ mod tests {
     #[test]
     fn validator_config_adds_web_tools_when_requested() {
         let with_web = AgentConfig::validator(
-            "source_check", "claude", "prompt".into(), PathBuf::from("/tmp/out.md"), "sonnet", 25, 600, true,
+            "source_check", "claude", &Default::default(), "prompt".into(), PathBuf::from("/tmp/out.md"), "sonnet", 25, 600, true,
         );
         let without_web = AgentConfig::validator(
-            "bias_check", "claude", "prompt".into(), PathBuf::from("/tmp/out.md"), "sonnet", 25, 600, false,
+            "bias_check", "claude", &Default::default(), "prompt".into(), PathBuf::from("/tmp/out.md"), "sonnet", 25, 600, false,
         );
         assert!(with_web.allowed_tools.contains(&"WebSearch".to_string()));
         assert!(!without_web.allowed_tools.contains(&"WebSearch".to_string()));
@@ -369,7 +417,7 @@ mod tests {
     #[test]
     fn revision_config_has_all_tools() {
         let config = AgentConfig::revision(
-            "claude", "prompt".into(), PathBuf::from("/tmp/out.md"), "opus", 25, 900,
+            "claude", &Default::default(), "prompt".into(), PathBuf::from("/tmp/out.md"), "opus", 25, 900,
         );
         assert_eq!(config.name, "revision");
         assert_eq!(config.model, "opus");

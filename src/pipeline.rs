@@ -182,7 +182,7 @@ impl TopicPipeline {
             let prompt_template = agent::load_prompt(&self.prompts_dir(), def.prompt_file)?;
             let prompt = prompt_template.replace("{topic}", &self.topic.input);
             let config = AgentConfig::research(
-                name, &self.config.cli_command, prompt, output_path,
+                name, &self.config.cli_command, &self.config.cli_env, prompt, output_path,
                 self.config.model_for(name),
                 self.config.max_turns_for(name),
                 self.config.timeout_for(name),
@@ -239,7 +239,7 @@ impl TopicPipeline {
             .replace("{research_dir}", &self.research_dir.to_string_lossy());
 
         let config = AgentConfig::synthesis(
-            &self.config.cli_command, prompt, output_path,
+            &self.config.cli_command, &self.config.cli_env, prompt, output_path,
             self.config.model_for("synthesizer"),
             self.config.max_turns_for("synthesizer"),
             self.config.timeout_for("synthesizer"),
@@ -294,7 +294,7 @@ impl TopicPipeline {
                 .replace("{validation_dir}", &validation_str);
 
             let config = AgentConfig::validator(
-                name, &self.config.cli_command, prompt, output_path,
+                name, &self.config.cli_command, &self.config.cli_env, prompt, output_path,
                 self.config.model_for(name),
                 self.config.max_turns_for(name),
                 self.config.timeout_for(name),
@@ -352,7 +352,7 @@ impl TopicPipeline {
             .replace("{validation_dir}", &self.validation_dir.to_string_lossy());
 
         let config = AgentConfig::revision(
-            &self.config.cli_command, prompt, output_path,
+            &self.config.cli_command, &self.config.cli_env, prompt, output_path,
             self.config.model_for("revision"),
             self.config.max_turns_for("revision"),
             self.config.timeout_for("revision"),
@@ -612,6 +612,7 @@ mod tests {
     fn test_config(prompts_dir: &Path) -> Arc<Config> {
         Arc::new(Config {
             cli_command: "claude".to_string(),
+            cli_env: std::collections::HashMap::new(),
             max_concurrent_topics: 1,
             agent_timeout: 600,
             model: "sonnet".to_string(),

@@ -21,6 +21,11 @@ pub struct Config {
     #[serde(default = "default_cli_command")]
     pub cli_command: String,
 
+    /// Environment variables to set on agent subprocesses.
+    /// Use this to route auth, e.g., CLAUDE_CONFIG_DIR for ccs account profiles.
+    #[serde(default)]
+    pub cli_env: HashMap<String, String>,
+
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent_topics: usize,
 
@@ -102,6 +107,7 @@ impl Config {
             tracing::info!("No config file found at {}, using defaults", path.display());
             return Ok(Self {
                 cli_command: default_cli_command(),
+                cli_env: HashMap::new(),
                 max_concurrent_topics: default_max_concurrent(),
                 agent_timeout: default_timeout(),
                 model: default_model(),
