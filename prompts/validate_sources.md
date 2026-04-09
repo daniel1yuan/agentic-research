@@ -16,10 +16,17 @@ Check that the sources cited in the synthesis and research files are real, accur
 - **Tier 3**: Quality journalism, industry reports, well-sourced blog posts
 - **Tier 4**: Forum discussions, opinion pieces, social media
 
+## Constraints
+
+- You have a limited number of turns and a time limit. **Do not try to verify every source.**
+- Focus on a **spot check of the most impactful sources** — the ones most heavily relied upon for key claims in the synthesis.
+- Prioritize sources that support central conclusions over those cited for minor details.
+- Write your output file early, then refine if you have turns remaining.
+
 ## Validation checks
 
-### 1. Source existence
-- For each cited source, attempt to verify it exists using WebSearch and WebFetch
+### 1. Source existence (spot check)
+- For each selected source, attempt to verify it exists using WebSearch and WebFetch
 - Flag any sources that appear to be fabricated or that you cannot find evidence of
 - Note: not finding a source doesn't prove it's fake — it might be behind a paywall or in a database you can't access. Distinguish between "confirmed fake" and "unable to verify"
 
@@ -37,10 +44,6 @@ Check that the sources cited in the synthesis and research files are real, accur
 - Are the sources reasonably current for the topic?
 - Are outdated sources being used when more recent evidence exists?
 - Flag sources that have been retracted or significantly corrected
-
-### 5. Author credential verification
-- For expert sources, verify the claimed credentials
-- Flag cases where someone is presented as an authority without verifiable credentials
 
 ## Output format
 

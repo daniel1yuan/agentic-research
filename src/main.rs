@@ -60,6 +60,12 @@ enum Command {
         id: String,
     },
 
+    /// Reset a topic: wipe all outputs and re-queue for a fresh run
+    Reset {
+        /// Topic ID to reset
+        id: String,
+    },
+
     /// Re-queue failed and interrupted topics for retry
     Recover,
 
@@ -219,6 +225,12 @@ async fn main() -> Result<()> {
             let mut queue_manager = queue::QueueManager::new(queue_path, output_dir);
             queue_manager.remove_topic(&id)?;
             println!("Removed topic '{id}' from queue.");
+        }
+
+        Command::Reset { id } => {
+            let mut queue_manager = queue::QueueManager::new(queue_path, output_dir);
+            queue_manager.reset_topic(&id)?;
+            println!("Reset topic '{id}'. All outputs wiped and re-queued for fresh run.");
         }
 
         Command::Recover => {

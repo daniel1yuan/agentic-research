@@ -233,6 +233,42 @@ impl QueueManager {
         Ok(recovered)
     }
 
+    /// Wipe all outputs for a topic and re-queue it for a fresh run.
+    pub fn reset_topic(&mut self, id: &str) -> Result<()> {
+        let topic_dir = self.output_dir.join(id);
+
+        // Read the meta to get the original input text for re-queuing.
+        let meta_path = topic_dir.join("meta.yaml");
+        let input = if meta_path.exists() {
+            let contents = std::fs::read_to_string(&meta_path)?;
+            let meta: TopicMeta = serde_yaml::from_str(&contents)?;
+            meta.input
+        } else {
+            // Fall back to checking the queue file itself.
+            self.with_queue_lock(|queue| {
+                queue.topics.iter()
+                    .find(|t| t.id == id)
+                    .map(|t| t.input.clone())
+                    .ok_or_else(|| anyhow::anyhow!("Topic '{id}' not found in queue or output directory"))
+            })?
+        };
+
+        // Remove the entire output directory for this topic.
+        if topic_dir.exists() {
+            std::fs::remove_dir_all(&topic_dir)?;
+        }
+
+        // Ensure it's in the queue.
+        self.with_queue_lock_mut(|queue| {
+            queue.topics.retain(|t| t.id != id);
+            queue.topics.push(Topic { id: id.to_string(), input });
+            Ok(())
+        })?;
+
+        tracing::info!(topic_id = %id, "Topic reset");
+        Ok(())
+    }
+
     pub fn fail_topic(&mut self, topic: &Topic, error: &str) -> Result<()> {
         let mut meta = self.read_meta(topic)?;
         meta.status = "failed".to_string();

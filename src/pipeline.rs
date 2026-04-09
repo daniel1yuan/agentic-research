@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::agent::{self, AgentConfig, AgentRunner};
+use crate::agent::{self, AgentConfig, AgentRunner, ThrottledRunner};
 use crate::config::Config;
 use crate::progress;
 use crate::queue::{QueueManager, Topic};
@@ -395,7 +395,12 @@ impl WorkerPool {
         topics: &[Topic],
         queue_manager: QueueManager,
     ) -> Vec<(String, bool)> {
-        let runner: Arc<dyn AgentRunner> = Arc::new(agent::ClaudeRunner);
+        let inner: Arc<dyn AgentRunner> = Arc::new(agent::ClaudeRunner);
+        let runner: Arc<dyn AgentRunner> = Arc::new(ThrottledRunner::new(
+            inner,
+            self.config.max_concurrent_agents,
+            &self.config.model_concurrency,
+        ));
         self.process_all_with_runner(topics, queue_manager, runner).await
     }
 
@@ -614,6 +619,8 @@ mod tests {
             cli_command: "claude".to_string(),
             cli_env: std::collections::HashMap::new(),
             max_concurrent_topics: 1,
+            max_concurrent_agents: 10,
+            model_concurrency: std::collections::HashMap::new(),
             agent_timeout: 600,
             model: "sonnet".to_string(),
             max_turns: crate::config::DEFAULT_MAX_TURNS,

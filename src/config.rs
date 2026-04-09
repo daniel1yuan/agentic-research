@@ -29,6 +29,15 @@ pub struct Config {
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent_topics: usize,
 
+    /// Max agent invocations running at the same time globally (across all topics).
+    #[serde(default = "default_max_concurrent_agents")]
+    pub max_concurrent_agents: usize,
+
+    /// Per-model concurrency caps. Keys are model names/aliases (e.g., "opus", "sonnet").
+    /// An agent must acquire both the global and its model permit before running.
+    #[serde(default)]
+    pub model_concurrency: HashMap<String, usize>,
+
     /// In seconds.
     #[serde(default = "default_timeout")]
     pub agent_timeout: u64,
@@ -94,6 +103,7 @@ impl Config {
 
 fn default_cli_command() -> String { "claude".to_string() }
 fn default_max_concurrent() -> usize { 2 }
+fn default_max_concurrent_agents() -> usize { 4 }
 fn default_timeout() -> u64 { 600 }
 fn default_model() -> String { "sonnet".to_string() }
 fn default_max_turns() -> u32 { DEFAULT_MAX_TURNS }
@@ -109,6 +119,8 @@ impl Config {
                 cli_command: default_cli_command(),
                 cli_env: HashMap::new(),
                 max_concurrent_topics: default_max_concurrent(),
+                max_concurrent_agents: default_max_concurrent_agents(),
+                model_concurrency: HashMap::new(),
                 agent_timeout: default_timeout(),
                 model: default_model(),
                 max_turns: default_max_turns(),
