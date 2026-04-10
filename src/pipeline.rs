@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 use crate::agent::{self, AgentConfig, AgentRunner, ThrottledRunner};
 use crate::config::Config;
 use crate::progress;
-use crate::queue::{QueueManager, Topic};
+use crate::queue::{AgentStatus, QueueManager, Topic, TopicStatus};
 use crate::roster;
 
 /// Non-empty file means a previous run already produced this output.
@@ -105,7 +105,7 @@ impl TopicPipeline {
         self.check_cost_limit().await?;
 
         progress::phase(&self.topic.id, "Synthesizing...");
-        self.queue_manager.lock().await.update_status(&self.topic, "synthesizing")?;
+        self.queue_manager.lock().await.update_status(&self.topic, TopicStatus::Synthesizing)?;
         let synthesis_ok = self.run_synthesis_phase().await?;
         if !synthesis_ok {
             anyhow::bail!("Synthesis phase failed");
@@ -113,7 +113,7 @@ impl TopicPipeline {
         self.check_cost_limit().await?;
 
         progress::phase(&self.topic.id, "Validating...");
-        self.queue_manager.lock().await.update_status(&self.topic, "validating")?;
+        self.queue_manager.lock().await.update_status(&self.topic, TopicStatus::Validating)?;
         let (validators_passed, validators_total) = self.run_validation_phase().await?;
         if validators_passed == 0 && validators_total > 0 {
             anyhow::bail!(
@@ -133,7 +133,7 @@ impl TopicPipeline {
         self.check_cost_limit().await?;
 
         progress::phase(&self.topic.id, "Revising...");
-        self.queue_manager.lock().await.update_status(&self.topic, "revising")?;
+        self.queue_manager.lock().await.update_status(&self.topic, TopicStatus::Revising)?;
         self.run_revision_phase().await?;
 
         self.queue_manager.lock().await.complete_topic(&self.topic)?;
@@ -173,7 +173,7 @@ impl TopicPipeline {
             if agent_output_exists(&output_path) {
                 progress::agent_cached(name);
                 self.queue_manager.lock().await.record_agent_result(
-                    &self.topic, name, "done (cached)", 0.0, None, None,
+                    &self.topic, name, AgentStatus::DoneCached, 0.0, None, None,
                 )?;
                 already_done += 1;
                 continue;
@@ -181,14 +181,11 @@ impl TopicPipeline {
 
             let prompt_template = agent::load_prompt(&self.prompts_dir(), def.prompt_file)?;
             let prompt = prompt_template.replace("{topic}", &self.topic.input);
-            let config = AgentConfig::research(
-                name, &self.config.cli_command, &self.config.cli_env, prompt, output_path,
-                self.config.model_for(name),
-                self.config.max_turns_for(name),
-                self.config.timeout_for(name),
+            let agent_config = AgentConfig::new(
+                name, &self.config, prompt, output_path, def.allowed_tools,
             );
             agent_names.push(name);
-            agent_futures.push(self.runner.run_agent(config));
+            agent_futures.push(self.runner.run_agent(agent_config));
         }
 
         if !agent_names.is_empty() {
@@ -205,9 +202,9 @@ impl TopicPipeline {
                 Ok(result) => {
                     progress::agent_done(name, &result);
                     self.save_raw_response(name, &result);
-                    let status = if result.success { "done" } else { "failed" };
+                    let agent_status = if result.success { AgentStatus::Done } else { AgentStatus::Failed };
                     qm.record_agent_result(
-                        &self.topic, name, status, result.duration_seconds,
+                        &self.topic, name, agent_status, result.duration_seconds,
                         result.error.as_deref(), result.usage.as_ref(),
                     )?;
                     if result.success { newly_succeeded += 1; }
@@ -215,7 +212,7 @@ impl TopicPipeline {
                 Err(e) => {
                     progress::agent_error(name, &e.to_string());
                     qm.record_agent_result(
-                        &self.topic, name, "failed", 0.0, Some(&e.to_string()), None,
+                        &self.topic, name, AgentStatus::Failed, 0.0, Some(&e.to_string()), None,
                     )?;
                 }
             }
@@ -229,7 +226,7 @@ impl TopicPipeline {
 
         if agent_output_exists(&output_path) {
             progress::agent_cached("synthesizer");
-            self.queue_manager.lock().await.record_agent_result(&self.topic, "synthesis", "done (cached)", 0.0, None, None)?;
+            self.queue_manager.lock().await.record_agent_result(&self.topic, "synthesis", AgentStatus::DoneCached, 0.0, None, None)?;
             return Ok(true);
         }
 
@@ -238,24 +235,21 @@ impl TopicPipeline {
             .replace("{topic}", &self.topic.input)
             .replace("{research_dir}", &self.research_dir.to_string_lossy());
 
-        let config = AgentConfig::synthesis(
-            &self.config.cli_command, &self.config.cli_env, prompt, output_path,
-            self.config.model_for("synthesizer"),
-            self.config.max_turns_for("synthesizer"),
-            self.config.timeout_for("synthesizer"),
+        let agent_config = AgentConfig::new(
+            "synthesizer", &self.config, prompt, output_path, roster::SYNTHESIS_TOOLS,
         );
 
         progress::agents_starting(&["synthesizer"]);
         let heartbeat = progress::start_heartbeat(30);
-        let result = self.runner.run_agent(config).await?;
+        let result = self.runner.run_agent(agent_config).await?;
         heartbeat.stop();
 
         progress::agent_done("synthesizer", &result);
         self.save_raw_response("synthesis", &result);
 
-        let status = if result.success { "done" } else { "failed" };
+        let agent_status = if result.success { AgentStatus::Done } else { AgentStatus::Failed };
         self.queue_manager.lock().await.record_agent_result(
-            &self.topic, "synthesis", status, result.duration_seconds,
+            &self.topic, "synthesis", agent_status, result.duration_seconds,
             result.error.as_deref(), result.usage.as_ref(),
         )?;
 
@@ -280,7 +274,7 @@ impl TopicPipeline {
             if agent_output_exists(&output_path) {
                 progress::agent_cached(name);
                 self.queue_manager.lock().await.record_agent_result(
-                    &self.topic, name, "done (cached)", 0.0, None, None,
+                    &self.topic, name, AgentStatus::DoneCached, 0.0, None, None,
                 )?;
                 succeeded += 1;
                 continue;
@@ -293,15 +287,11 @@ impl TopicPipeline {
                 .replace("{research_dir}", &research_str)
                 .replace("{validation_dir}", &validation_str);
 
-            let config = AgentConfig::validator(
-                name, &self.config.cli_command, &self.config.cli_env, prompt, output_path,
-                self.config.model_for(name),
-                self.config.max_turns_for(name),
-                self.config.timeout_for(name),
-                def.needs_web,
+            let agent_config = AgentConfig::new(
+                name, &self.config, prompt, output_path, def.allowed_tools,
             );
             agent_names.push(name);
-            agent_futures.push(self.runner.run_agent(config));
+            agent_futures.push(self.runner.run_agent(agent_config));
         }
 
         if !agent_names.is_empty() {
@@ -317,9 +307,9 @@ impl TopicPipeline {
                 Ok(result) => {
                     progress::agent_done(name, &result);
                     self.save_raw_response(name, &result);
-                    let status = if result.success { "done" } else { "failed" };
+                    let agent_status = if result.success { AgentStatus::Done } else { AgentStatus::Failed };
                     qm.record_agent_result(
-                        &self.topic, name, status, result.duration_seconds,
+                        &self.topic, name, agent_status, result.duration_seconds,
                         result.error.as_deref(), result.usage.as_ref(),
                     )?;
                     if result.success { succeeded += 1; }
@@ -327,7 +317,7 @@ impl TopicPipeline {
                 Err(e) => {
                     progress::agent_error(name, &e.to_string());
                     qm.record_agent_result(
-                        &self.topic, name, "failed", 0.0, Some(&e.to_string()), None,
+                        &self.topic, name, AgentStatus::Failed, 0.0, Some(&e.to_string()), None,
                     )?;
                 }
             }
@@ -341,7 +331,7 @@ impl TopicPipeline {
 
         if agent_output_exists(&output_path) {
             progress::agent_cached("revision");
-            self.queue_manager.lock().await.record_agent_result(&self.topic, "revision", "done (cached)", 0.0, None, None)?;
+            self.queue_manager.lock().await.record_agent_result(&self.topic, "revision", AgentStatus::DoneCached, 0.0, None, None)?;
             return Ok(());
         }
 
@@ -351,24 +341,21 @@ impl TopicPipeline {
             .replace("{synthesis_path}", &self.topic_dir.join("overview.md").to_string_lossy())
             .replace("{validation_dir}", &self.validation_dir.to_string_lossy());
 
-        let config = AgentConfig::revision(
-            &self.config.cli_command, &self.config.cli_env, prompt, output_path,
-            self.config.model_for("revision"),
-            self.config.max_turns_for("revision"),
-            self.config.timeout_for("revision"),
+        let agent_config = AgentConfig::new(
+            "revision", &self.config, prompt, output_path, roster::REVISION_TOOLS,
         );
 
         progress::agents_starting(&["revision"]);
         let heartbeat = progress::start_heartbeat(30);
-        let result = self.runner.run_agent(config).await?;
+        let result = self.runner.run_agent(agent_config).await?;
         heartbeat.stop();
 
         progress::agent_done("revision", &result);
         self.save_raw_response("revision", &result);
 
-        let status = if result.success { "done" } else { "failed" };
+        let agent_status = if result.success { AgentStatus::Done } else { AgentStatus::Failed };
         self.queue_manager.lock().await.record_agent_result(
-            &self.topic, "revision", status, result.duration_seconds,
+            &self.topic, "revision", agent_status, result.duration_seconds,
             result.error.as_deref(), result.usage.as_ref(),
         )?;
 
@@ -463,7 +450,7 @@ impl WorkerPool {
 mod tests {
     use super::*;
     use crate::agent::{AgentConfig, AgentResult, AgentRunner};
-    use crate::queue::{QueueManager, Topic};
+    use crate::queue::{AgentStatus, QueueManager, Topic, TopicStatus};
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -659,7 +646,7 @@ mod tests {
         assert!(qm.get_pending_topics().unwrap().is_empty());
 
         let meta = qm.read_meta(&make_topic("test-topic", "")).unwrap();
-        assert_eq!(meta.status, "done");
+        assert_eq!(meta.status, TopicStatus::Done);
         assert!(meta.completed_at.is_some());
 
         assert!(output_dir.join("test-topic/research/academic.md").exists());
@@ -688,9 +675,9 @@ mod tests {
         assert_eq!(runner.invocations(), 7);
 
         let meta = qm.read_meta(&make_topic("test-topic", "")).unwrap();
-        assert_eq!(meta.agents["research_academic"].status, "done (cached)");
-        assert_eq!(meta.agents["research_expert"].status, "done (cached)");
-        assert_eq!(meta.agents["research_general"].status, "done");
+        assert_eq!(meta.agents["research_academic"].status, AgentStatus::DoneCached);
+        assert_eq!(meta.agents["research_expert"].status, AgentStatus::DoneCached);
+        assert_eq!(meta.agents["research_general"].status, AgentStatus::Done);
     }
 
     #[tokio::test]
@@ -735,7 +722,7 @@ mod tests {
         assert_eq!(runner.invocations(), 3);
 
         let meta = qm.read_meta(&make_topic("test-topic", "")).unwrap();
-        assert_eq!(meta.status, "failed");
+        assert_eq!(meta.status, TopicStatus::Failed);
         assert!(meta.error.as_ref().unwrap().contains("Research phase failed"));
     }
 
@@ -756,7 +743,7 @@ mod tests {
         assert_eq!(runner.invocations(), 3);
 
         let meta = qm.read_meta(&make_topic("test-topic", "")).unwrap();
-        assert_eq!(meta.status, "failed");
+        assert_eq!(meta.status, TopicStatus::Failed);
         assert!(meta.error.as_ref().unwrap().contains("Synthesis phase failed"));
     }
 
@@ -832,7 +819,7 @@ mod tests {
         assert!(!results[0].1, "pipeline should fail when all validators fail");
 
         let meta = qm.read_meta(&make_topic("test-topic", "")).unwrap();
-        assert_eq!(meta.status, "failed");
+        assert_eq!(meta.status, TopicStatus::Failed);
         assert!(meta.error.as_ref().unwrap().contains("Validation phase failed"));
     }
 
@@ -847,7 +834,7 @@ mod tests {
         assert!(!results[0].1, "pipeline should fail when revision fails");
 
         let meta = qm.read_meta(&make_topic("test-topic", "")).unwrap();
-        assert_eq!(meta.status, "failed");
+        assert_eq!(meta.status, TopicStatus::Failed);
         assert!(meta.error.as_ref().unwrap().contains("Revision phase failed"));
     }
 
@@ -862,9 +849,9 @@ mod tests {
         assert!(results[0].1, "pipeline should succeed with partial validation");
 
         let meta = qm.read_meta(&make_topic("test-topic", "")).unwrap();
-        assert_eq!(meta.status, "done");
-        assert_eq!(meta.agents["validate_bias"].status, "failed");
-        assert_eq!(meta.agents["validate_claims"].status, "done");
+        assert_eq!(meta.status, TopicStatus::Done);
+        assert_eq!(meta.agents["validate_bias"].status, AgentStatus::Failed);
+        assert_eq!(meta.agents["validate_claims"].status, AgentStatus::Done);
     }
 
     #[tokio::test]
@@ -878,8 +865,8 @@ mod tests {
         assert!(!results[0].1);
 
         let meta = qm.read_meta(&make_topic("test-topic", "")).unwrap();
-        assert_eq!(meta.status, "failed");
+        assert_eq!(meta.status, TopicStatus::Failed);
         assert!(!meta.agents.contains_key("validate_bias"));
-        assert_eq!(meta.agents["research_academic"].status, "done");
+        assert_eq!(meta.agents["research_academic"].status, AgentStatus::Done);
     }
 }

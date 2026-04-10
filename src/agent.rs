@@ -40,75 +40,23 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
-    pub fn research(name: &str, cli_command: &str, cli_env: &std::collections::HashMap<String, String>, prompt: String, output_path: PathBuf, model: &str, max_turns: u32, timeout: u64) -> Self {
+    pub fn new(
+        name: &str,
+        config: &crate::config::Config,
+        prompt: String,
+        output_path: PathBuf,
+        allowed_tools: &[&str],
+    ) -> Self {
         Self {
             name: name.to_string(),
-            cli_command: cli_command.to_string(),
-            cli_env: cli_env.clone(),
+            cli_command: config.cli_command.clone(),
+            cli_env: config.cli_env.clone(),
             prompt,
             output_path,
-            model: model.to_string(),
-            max_turns,
-            timeout_seconds: timeout,
-            allowed_tools: vec![
-                "WebSearch".into(), "WebFetch".into(),
-                "Read".into(), "Write".into(),
-            ],
-        }
-    }
-
-    pub fn synthesis(cli_command: &str, cli_env: &std::collections::HashMap<String, String>, prompt: String, output_path: PathBuf, model: &str, max_turns: u32, timeout: u64) -> Self {
-        Self {
-            name: "synthesizer".to_string(),
-            cli_command: cli_command.to_string(),
-            cli_env: cli_env.clone(),
-            prompt,
-            output_path,
-            model: model.to_string(),
-            max_turns,
-            timeout_seconds: timeout,
-            allowed_tools: vec![
-                "Read".into(), "Write".into(), "Glob".into(), "Grep".into(),
-            ],
-        }
-    }
-
-    pub fn validator(name: &str, cli_command: &str, cli_env: &std::collections::HashMap<String, String>, prompt: String, output_path: PathBuf, model: &str, max_turns: u32, timeout: u64, needs_web: bool) -> Self {
-        let mut tools = vec![
-            "Read".into(), "Write".into(), "Glob".into(), "Grep".into(),
-        ];
-        if needs_web {
-            tools.push("WebSearch".into());
-            tools.push("WebFetch".into());
-        }
-
-        Self {
-            name: name.to_string(),
-            cli_command: cli_command.to_string(),
-            cli_env: cli_env.clone(),
-            prompt,
-            output_path,
-            model: model.to_string(),
-            max_turns,
-            timeout_seconds: timeout,
-            allowed_tools: tools,
-        }
-    }
-
-    pub fn revision(cli_command: &str, cli_env: &std::collections::HashMap<String, String>, prompt: String, output_path: PathBuf, model: &str, max_turns: u32, timeout: u64) -> Self {
-        Self {
-            name: "revision".to_string(),
-            cli_command: cli_command.to_string(),
-            cli_env: cli_env.clone(),
-            prompt,
-            output_path,
-            model: model.to_string(),
-            max_turns,
-            timeout_seconds: timeout,
-            allowed_tools: vec![
-                "Read".into(), "Write".into(), "Glob".into(), "Grep".into(),
-                "WebSearch".into(), "WebFetch".into(),
-            ],
+            model: config.model_for(name).to_string(),
+            max_turns: config.max_turns_for(name),
+            timeout_seconds: config.timeout_for(name),
+            allowed_tools: allowed_tools.iter().map(|s| s.to_string()).collect(),
         }
     }
 }
@@ -573,47 +521,52 @@ mod tests {
     }
 
     #[test]
-    fn research_config_has_web_tools() {
-        let config = AgentConfig::research(
-            "test_agent", "claude", &Default::default(), "prompt".into(), PathBuf::from("/tmp/out.md"), "sonnet", 25, 600,
-        );
-        assert_eq!(config.name, "test_agent");
-        assert!(config.allowed_tools.contains(&"WebSearch".to_string()));
-        assert!(config.allowed_tools.contains(&"WebFetch".to_string()));
-        assert!(!config.allowed_tools.contains(&"Glob".to_string()));
-    }
+    fn new_resolves_config_and_per_agent_overrides() {
+        use crate::config::{Config, AgentOverride};
 
-    #[test]
-    fn synthesis_config_has_no_web_tools() {
-        let config = AgentConfig::synthesis(
-            "claude", &Default::default(), "prompt".into(), PathBuf::from("/tmp/out.md"), "sonnet", 25, 600,
-        );
-        assert_eq!(config.name, "synthesizer");
-        assert!(!config.allowed_tools.contains(&"WebSearch".to_string()));
-        assert!(config.allowed_tools.contains(&"Glob".to_string()));
-    }
+        let mut agents = HashMap::new();
+        agents.insert("special_agent".to_string(), AgentOverride {
+            model: Some("opus".to_string()),
+            max_turns: Some(50),
+            timeout: Some(1200),
+        });
 
-    #[test]
-    fn validator_config_adds_web_tools_when_requested() {
-        let with_web = AgentConfig::validator(
-            "source_check", "claude", &Default::default(), "prompt".into(), PathBuf::from("/tmp/out.md"), "sonnet", 25, 600, true,
-        );
-        let without_web = AgentConfig::validator(
-            "bias_check", "claude", &Default::default(), "prompt".into(), PathBuf::from("/tmp/out.md"), "sonnet", 25, 600, false,
-        );
-        assert!(with_web.allowed_tools.contains(&"WebSearch".to_string()));
-        assert!(!without_web.allowed_tools.contains(&"WebSearch".to_string()));
-    }
+        let config = Config {
+            cli_command: "my-claude".to_string(),
+            cli_env: HashMap::new(),
+            max_concurrent_topics: 1,
+            max_concurrent_agents: 1,
+            model_concurrency: HashMap::new(),
+            agent_timeout: 600,
+            model: "sonnet".to_string(),
+            max_turns: 25,
+            output_dir: String::new(),
+            queue_file: String::new(),
+            prompts_dir: String::new(),
+            max_cost_per_topic: 0.0,
+            agents,
+        };
 
-    #[test]
-    fn revision_config_has_all_tools() {
-        let config = AgentConfig::revision(
-            "claude", &Default::default(), "prompt".into(), PathBuf::from("/tmp/out.md"), "opus", 25, 900,
+        // agent with per-agent overrides
+        let special = AgentConfig::new(
+            "special_agent", &config, "prompt".into(),
+            PathBuf::from("/tmp/out.md"), &["Read", "Write"],
         );
-        assert_eq!(config.name, "revision");
-        assert_eq!(config.model, "opus");
-        assert!(config.allowed_tools.contains(&"WebSearch".to_string()));
-        assert!(config.allowed_tools.contains(&"Glob".to_string()));
+        assert_eq!(special.model, "opus");
+        assert_eq!(special.max_turns, 50);
+        assert_eq!(special.timeout_seconds, 1200);
+        assert_eq!(special.cli_command, "my-claude");
+        assert_eq!(special.allowed_tools, vec!["Read", "Write"]);
+
+        // agent without overrides falls back to global defaults
+        let regular = AgentConfig::new(
+            "regular_agent", &config, "prompt".into(),
+            PathBuf::from("/tmp/out.md"), &["Read", "Write", "Glob"],
+        );
+        assert_eq!(regular.model, "sonnet");
+        assert_eq!(regular.max_turns, 25);
+        assert_eq!(regular.timeout_seconds, 600);
+        assert_eq!(regular.allowed_tools, vec!["Read", "Write", "Glob"]);
     }
 
     #[test]

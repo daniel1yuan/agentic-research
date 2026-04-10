@@ -19,6 +19,58 @@ pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TopicStatus {
+    Pending,
+    Researching,
+    Synthesizing,
+    Validating,
+    Revising,
+    Done,
+    Failed,
+    #[default]
+    Unknown,
+}
+
+impl std::fmt::Display for TopicStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::Pending => "pending",
+            Self::Researching => "researching",
+            Self::Synthesizing => "synthesizing",
+            Self::Validating => "validating",
+            Self::Revising => "revising",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+        };
+        f.write_str(label)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AgentStatus {
+    #[default]
+    #[serde(rename = "done")]
+    Done,
+    #[serde(rename = "failed")]
+    Failed,
+    #[serde(rename = "done (cached)")]
+    DoneCached,
+}
+
+impl std::fmt::Display for AgentStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::DoneCached => "done (cached)",
+        };
+        f.write_str(label)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Topic {
     pub id: String,
@@ -35,7 +87,7 @@ pub struct QueueFile {
 pub struct TopicMeta {
     pub id: String,
     pub input: String,
-    pub status: String,
+    pub status: TopicStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -48,7 +100,7 @@ pub struct TopicMeta {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct AgentMeta {
-    pub status: String,
+    pub status: AgentStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -111,7 +163,7 @@ impl QueueManager {
         let meta = TopicMeta {
             id: topic.id.clone(),
             input: topic.input.clone(),
-            status: "researching".to_string(),
+            status: TopicStatus::Researching,
             started_at: Some(chrono::Utc::now().to_rfc3339()),
             completed_at: None,
             error: None,
@@ -121,14 +173,14 @@ impl QueueManager {
         self.write_meta(topic, &meta)
     }
 
-    pub fn update_status(&mut self, topic: &Topic, status: &str) -> Result<()> {
+    pub fn update_status(&mut self, topic: &Topic, status: TopicStatus) -> Result<()> {
         let mut meta = self.read_meta(topic)?;
-        meta.status = status.to_string();
 
-        if status == "done" {
+        if status == TopicStatus::Done {
             meta.completed_at = Some(chrono::Utc::now().to_rfc3339());
         }
 
+        meta.status = status;
         self.write_meta(topic, &meta)
     }
 
@@ -136,7 +188,7 @@ impl QueueManager {
         &mut self,
         topic: &Topic,
         agent_name: &str,
-        status: &str,
+        status: AgentStatus,
         duration_seconds: f64,
         error: Option<&str>,
         usage: Option<&crate::agent::AgentUsage>,
@@ -155,7 +207,7 @@ impl QueueManager {
         meta.agents.insert(
             agent_name.to_string(),
             AgentMeta {
-                status: status.to_string(),
+                status,
                 duration: Some(format!("{duration_seconds:.1}s")),
                 error: error.map(String::from),
                 input_tokens,
@@ -170,7 +222,7 @@ impl QueueManager {
     }
 
     pub fn complete_topic(&mut self, topic: &Topic) -> Result<()> {
-        self.update_status(topic, "done")?;
+        self.update_status(topic, TopicStatus::Done)?;
         self.with_queue_lock_mut(|queue| {
             queue.topics.retain(|t| t.id != topic.id);
             Ok(())
@@ -196,15 +248,16 @@ impl QueueManager {
             let contents = std::fs::read_to_string(&meta_path)?;
             let meta: TopicMeta = serde_yaml::from_str(&contents)?;
 
-            if meta.status == "failed" || meta.status == "researching"
-                || meta.status == "synthesizing" || meta.status == "validating"
-                || meta.status == "revising"
-            {
+            if matches!(meta.status,
+                TopicStatus::Failed | TopicStatus::Researching
+                | TopicStatus::Synthesizing | TopicStatus::Validating
+                | TopicStatus::Revising
+            ) {
                 // reset meta to allow resume
                 let reset_meta = TopicMeta {
                     id: meta.id.clone(),
                     input: meta.input.clone(),
-                    status: "pending".to_string(),
+                    status: TopicStatus::Pending,
                     started_at: None,
                     completed_at: None,
                     error: None,
@@ -271,7 +324,7 @@ impl QueueManager {
 
     pub fn fail_topic(&mut self, topic: &Topic, error: &str) -> Result<()> {
         let mut meta = self.read_meta(topic)?;
-        meta.status = "failed".to_string();
+        meta.status = TopicStatus::Failed;
         meta.error = Some(error.to_string());
         self.write_meta(topic, &meta)?;
         // remove from queue so it doesn't auto-retry. use `recover` to re-queue.
@@ -289,7 +342,7 @@ impl QueueManager {
             return false;
         }
         self.read_meta(topic)
-            .map(|m| m.status == "done" || m.status == "failed")
+            .map(|m| matches!(m.status, TopicStatus::Done | TopicStatus::Failed))
             .unwrap_or(false)
     }
 
@@ -303,7 +356,7 @@ impl QueueManager {
             return Ok(TopicMeta {
                 id: topic.id.clone(),
                 input: topic.input.clone(),
-                status: "unknown".to_string(),
+                status: TopicStatus::Unknown,
                 ..Default::default()
             });
         }
@@ -393,13 +446,14 @@ impl QueueManager {
                 let contents = std::fs::read_to_string(&meta_path)?;
                 let meta: TopicMeta = serde_yaml::from_str(&contents)?;
 
-                match meta.status.as_str() {
-                    "done" => done.push(meta),
-                    "failed" => failed.push(meta),
-                    "researching" | "synthesizing" | "validating" | "revising" => {
+                match meta.status {
+                    TopicStatus::Done => done.push(meta),
+                    TopicStatus::Failed => failed.push(meta),
+                    TopicStatus::Researching | TopicStatus::Synthesizing
+                    | TopicStatus::Validating | TopicStatus::Revising => {
                         in_progress.push(meta);
                     }
-                    _ => {}
+                    TopicStatus::Pending | TopicStatus::Unknown => {}
                 }
             }
         }
@@ -574,7 +628,7 @@ mod tests {
         let contents = std::fs::read_to_string(&meta_path).unwrap();
         let meta: TopicMeta = serde_yaml::from_str(&contents).unwrap();
         assert_eq!(meta.id, "fasting");
-        assert_eq!(meta.status, "researching");
+        assert_eq!(meta.status, TopicStatus::Researching);
         assert!(meta.started_at.is_some());
         assert!(meta.completed_at.is_none());
     }
@@ -587,12 +641,12 @@ mod tests {
         let topic = make_topic("fasting", "Intermittent fasting");
 
         qm.claim_topic(&topic).unwrap();
-        qm.update_status(&topic, "synthesizing").unwrap();
+        qm.update_status(&topic, TopicStatus::Synthesizing).unwrap();
 
         let meta_path = dir.path().join("output/fasting/meta.yaml");
         let contents = std::fs::read_to_string(&meta_path).unwrap();
         let meta: TopicMeta = serde_yaml::from_str(&contents).unwrap();
-        assert_eq!(meta.status, "synthesizing");
+        assert_eq!(meta.status, TopicStatus::Synthesizing);
     }
 
     #[test]
@@ -601,10 +655,10 @@ mod tests {
         let topic = make_topic("fasting", "Intermittent fasting");
 
         qm.claim_topic(&topic).unwrap();
-        qm.update_status(&topic, "done").unwrap();
+        qm.update_status(&topic, TopicStatus::Done).unwrap();
 
         let meta = qm.read_meta(&topic).unwrap();
-        assert_eq!(meta.status, "done");
+        assert_eq!(meta.status, TopicStatus::Done);
         assert!(meta.completed_at.is_some());
     }
 
@@ -616,19 +670,19 @@ mod tests {
         let topic = make_topic("fasting", "Intermittent fasting");
 
         qm.claim_topic(&topic).unwrap();
-        qm.record_agent_result(&topic, "research_academic", "done", 123.4, None, None).unwrap();
-        qm.record_agent_result(&topic, "research_expert", "failed", 45.0, Some("timed out"), None).unwrap();
+        qm.record_agent_result(&topic, "research_academic", AgentStatus::Done, 123.4, None, None).unwrap();
+        qm.record_agent_result(&topic, "research_expert", AgentStatus::Failed, 45.0, Some("timed out"), None).unwrap();
 
         let meta = qm.read_meta(&topic).unwrap();
         assert_eq!(meta.agents.len(), 2);
 
         let academic = &meta.agents["research_academic"];
-        assert_eq!(academic.status, "done");
+        assert_eq!(academic.status, AgentStatus::Done);
         assert_eq!(academic.duration.as_deref(), Some("123.4s"));
         assert!(academic.error.is_none());
 
         let expert = &meta.agents["research_expert"];
-        assert_eq!(expert.status, "failed");
+        assert_eq!(expert.status, AgentStatus::Failed);
         assert_eq!(expert.error.as_deref(), Some("timed out"));
     }
 
@@ -650,7 +704,7 @@ mod tests {
 
         // meta says done
         let meta = qm.read_meta(&topic).unwrap();
-        assert_eq!(meta.status, "done");
+        assert_eq!(meta.status, TopicStatus::Done);
         assert!(meta.completed_at.is_some());
     }
 
@@ -672,7 +726,7 @@ mod tests {
 
         // meta records failure
         let meta = qm.read_meta(&topic).unwrap();
-        assert_eq!(meta.status, "failed");
+        assert_eq!(meta.status, TopicStatus::Failed);
         assert_eq!(meta.error.as_deref(), Some("research agents all timed out"));
     }
 
@@ -724,10 +778,10 @@ mod tests {
         // process alpha
         let alpha = make_topic("alpha", "Topic A");
         qm.claim_topic(&alpha).unwrap();
-        qm.update_status(&alpha, "researching").unwrap();
-        qm.record_agent_result(&alpha, "research_academic", "done", 100.0, None, None).unwrap();
-        qm.update_status(&alpha, "synthesizing").unwrap();
-        qm.update_status(&alpha, "validating").unwrap();
+        qm.update_status(&alpha, TopicStatus::Researching).unwrap();
+        qm.record_agent_result(&alpha, "research_academic", AgentStatus::Done, 100.0, None, None).unwrap();
+        qm.update_status(&alpha, TopicStatus::Synthesizing).unwrap();
+        qm.update_status(&alpha, TopicStatus::Validating).unwrap();
         qm.complete_topic(&alpha).unwrap();
 
         // alpha gone from queue, beta remains
@@ -816,20 +870,20 @@ mod tests {
         let meta = TopicMeta {
             id: "test".to_string(),
             input: "A multiline\ntopic input".to_string(),
-            status: "done".to_string(),
+            status: TopicStatus::Done,
             started_at: Some("2026-04-07T12:00:00Z".to_string()),
             completed_at: Some("2026-04-07T12:15:00Z".to_string()),
             error: None,
             agents: {
                 let mut map = std::collections::BTreeMap::new();
                 map.insert("research_academic".to_string(), AgentMeta {
-                    status: "done".to_string(),
+                    status: AgentStatus::Done,
                     duration: Some("120.5s".to_string()),
                     error: None,
                     ..Default::default()
                 });
                 map.insert("synthesis".to_string(), AgentMeta {
-                    status: "failed".to_string(),
+                    status: AgentStatus::Failed,
                     duration: Some("30.0s".to_string()),
                     error: Some("timed out".to_string()),
                     ..Default::default()
@@ -842,7 +896,7 @@ mod tests {
         let deserialized: TopicMeta = serde_yaml::from_str(&yaml).unwrap();
 
         assert_eq!(deserialized.id, "test");
-        assert_eq!(deserialized.status, "done");
+        assert_eq!(deserialized.status, TopicStatus::Done);
         assert_eq!(deserialized.agents.len(), 2);
         assert_eq!(deserialized.agents["synthesis"].error.as_deref(), Some("timed out"));
     }
@@ -873,7 +927,7 @@ mod tests {
         let topic = make_topic("fasting", "Intermittent fasting");
 
         qm.claim_topic(&topic).unwrap();
-        qm.record_agent_result(&topic, "research_academic", "done", 100.0, None, None).unwrap();
+        qm.record_agent_result(&topic, "research_academic", AgentStatus::Done, 100.0, None, None).unwrap();
         qm.fail_topic(&topic, "synthesis timed out").unwrap();
 
         // fail_topic removes from queue
@@ -890,11 +944,11 @@ mod tests {
 
         // meta reset to pending but agent results preserved
         let meta = qm.read_meta(&topic).unwrap();
-        assert_eq!(meta.status, "pending");
+        assert_eq!(meta.status, TopicStatus::Pending);
         assert!(meta.error.is_none());
         assert!(meta.started_at.is_none());
         assert_eq!(meta.agents.len(), 1);
-        assert_eq!(meta.agents["research_academic"].status, "done");
+        assert_eq!(meta.agents["research_academic"].status, AgentStatus::Done);
     }
 
     #[test]
@@ -904,13 +958,13 @@ mod tests {
 
         // simulate a topic that was mid-pipeline when the process died
         qm.claim_topic(&topic).unwrap();
-        qm.update_status(&topic, "synthesizing").unwrap();
+        qm.update_status(&topic, TopicStatus::Synthesizing).unwrap();
 
         let recovered = qm.recover_failed().unwrap();
         assert_eq!(recovered, vec!["fasting"]);
 
         let meta = qm.read_meta(&topic).unwrap();
-        assert_eq!(meta.status, "pending");
+        assert_eq!(meta.status, TopicStatus::Pending);
     }
 
     #[test]
@@ -974,7 +1028,7 @@ mod tests {
         // in-progress topic
         let in_progress = make_topic("in-progress", "In progress topic");
         qm.claim_topic(&in_progress).unwrap();
-        qm.update_status(&in_progress, "synthesizing").unwrap();
+        qm.update_status(&in_progress, TopicStatus::Synthesizing).unwrap();
 
         // done topic
         qm.add_topic("done-one", "Done topic").unwrap();
@@ -995,7 +1049,7 @@ mod tests {
 
         assert_eq!(report.in_progress.len(), 1);
         assert_eq!(report.in_progress[0].id, "in-progress");
-        assert_eq!(report.in_progress[0].status, "synthesizing");
+        assert_eq!(report.in_progress[0].status, TopicStatus::Synthesizing);
 
         assert_eq!(report.done.len(), 1);
         assert_eq!(report.done[0].id, "done-one");
@@ -1024,7 +1078,7 @@ mod tests {
         qm.add_topic("fasting", "Intermittent fasting").unwrap();
         let topic = make_topic("fasting", "Intermittent fasting");
         qm.claim_topic(&topic).unwrap();
-        qm.update_status(&topic, "researching").unwrap();
+        qm.update_status(&topic, TopicStatus::Researching).unwrap();
 
         let report = qm.get_all_statuses().unwrap();
 
