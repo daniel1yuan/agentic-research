@@ -56,6 +56,18 @@ pub fn topic_failed(topic_id: &str, error: &str) {
     println!("[{topic_id}] Failed: {preview}\n");
 }
 
+/// Print that a topic reached verify but the verifier flagged it for human review.
+/// Not a failure — the pipeline completed cleanly — but the final doc needs attention.
+pub fn topic_needs_review(topic_id: &str, reason: &str, total_cost: f64) {
+    let cost_part = if total_cost > 0.0 {
+        format!(" (${total_cost:.4} total)")
+    } else {
+        String::new()
+    };
+    let preview: String = reason.chars().take(120).collect();
+    println!("[{topic_id}] Needs human review{cost_part}: {preview}\n");
+}
+
 /// Spawn a background heartbeat that prints a dot every `interval` seconds
 /// while agents are running. Returns a handle to stop it.
 pub fn start_heartbeat(interval_secs: u64) -> HeartbeatHandle {

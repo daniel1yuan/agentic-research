@@ -1,5 +1,6 @@
 use anyhow::Result;
 use futures::future::join_all;
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -10,11 +11,98 @@ use crate::progress;
 use crate::queue::{AgentStatus, QueueManager, Topic, TopicStatus};
 use crate::roster;
 
-/// Non-empty file means a previous run already produced this output.
+/// A previous run is considered complete for this output only if both the output
+/// file has content AND a sidecar `.done` marker exists next to it. The marker is
+/// written after the agent reports success, so a partial write (agent crashed or
+/// timed out mid-stream, leaving a truncated fragment on disk) will be re-run on
+/// resume instead of being silently accepted as cache.
 pub(crate) fn agent_output_exists(path: &Path) -> bool {
     match std::fs::metadata(path) {
-        Ok(meta) => meta.len() > 0,
-        Err(_) => false,
+        Ok(meta) if meta.len() > 0 => sidecar_path(path).exists(),
+        _ => false,
+    }
+}
+
+/// The completion sidecar for an agent output file. For `academic.md` this is
+/// `academic.md.done`. Empty file — its existence is the signal.
+pub(crate) fn sidecar_path(output_path: &Path) -> PathBuf {
+    let mut s = output_path.as_os_str().to_os_string();
+    s.push(".done");
+    PathBuf::from(s)
+}
+
+/// Write the `.done` sidecar next to a freshly-completed output file. Failures to
+/// write the sidecar are logged but not fatal — the worst case is that the output
+/// gets re-run on the next resume, which is the safer failure mode.
+fn mark_output_complete(output_path: &Path) {
+    let sidecar = sidecar_path(output_path);
+    if let Err(e) = std::fs::write(&sidecar, "") {
+        tracing::warn!(
+            path = %sidecar.display(),
+            error = %e,
+            "Failed to write completion sidecar marker"
+        );
+    }
+}
+
+/// Terminal state of a pipeline run. `Done` means the verifier passed all checks
+/// and the topic can be marked complete. `NeedsReview` means the pipeline reached
+/// verify cleanly but the verifier flagged the final document — the topic is marked
+/// `needs_review` and removed from the queue, and `recover` can re-run it.
+enum PipelineOutcome {
+    Done,
+    NeedsReview(String),
+}
+
+/// The subset of the verify agent's YAML frontmatter we actually parse. We deliberately
+/// do not parse the per-check metrics — the `overall` verdict and `failed_checks` list
+/// are what drive topic-level routing. Everything else is for human consumption in the
+/// markdown body.
+#[derive(Debug, Deserialize)]
+struct VerifyReport {
+    #[serde(default)]
+    overall: String,
+    #[serde(default)]
+    failed_checks: Vec<String>,
+}
+
+/// Extract the YAML frontmatter block from a markdown file. Returns None if the file
+/// does not start with `---\n` or if no closing `---\n` is found.
+fn extract_yaml_frontmatter(content: &str) -> Option<&str> {
+    // Accept either LF or CRLF after the opening marker.
+    let rest = content.strip_prefix("---\n")
+        .or_else(|| content.strip_prefix("---\r\n"))?;
+    // Find the closing `---` on its own line.
+    let end = rest.find("\n---\n")
+        .or_else(|| rest.find("\n---\r\n"))?;
+    Some(&rest[..end])
+}
+
+/// Parse verify.md and return a verdict. Any failure mode (missing file, missing
+/// frontmatter, malformed YAML, `overall: fail`) produces `NeedsReview` — per the
+/// contract, a broken verifier must not silently pass topics.
+fn parse_verify_report(path: &Path) -> PipelineOutcome {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => return PipelineOutcome::NeedsReview(format!("could not read verify.md: {e}")),
+    };
+    let yaml = match extract_yaml_frontmatter(&content) {
+        Some(y) => y,
+        None => return PipelineOutcome::NeedsReview("verify.md is missing YAML frontmatter".to_string()),
+    };
+    let report: VerifyReport = match serde_yaml::from_str(yaml) {
+        Ok(r) => r,
+        Err(e) => return PipelineOutcome::NeedsReview(format!("malformed verify frontmatter: {e}")),
+    };
+    if report.overall == "pass" {
+        PipelineOutcome::Done
+    } else {
+        let checks = if report.failed_checks.is_empty() {
+            "unspecified".to_string()
+        } else {
+            report.failed_checks.join(", ")
+        };
+        PipelineOutcome::NeedsReview(format!("verify failed: {checks}"))
     }
 }
 
@@ -73,17 +161,36 @@ impl TopicPipeline {
     }
 
     async fn run(&self) -> bool {
-        if let Err(e) = self.run_inner().await {
-            tracing::error!(topic = %self.topic.id, error = %e, "Pipeline failed");
-            progress::topic_failed(&self.topic.id, &e.to_string());
-            if let Err(write_err) = self.queue_manager.lock().await.fail_topic(&self.topic, &e.to_string()) {
-                tracing::error!(topic = %self.topic.id, error = %write_err, "Failed to record topic failure in queue");
+        match self.run_inner().await {
+            Ok(PipelineOutcome::Done) => {
+                if let Err(e) = self.queue_manager.lock().await.complete_topic(&self.topic) {
+                    tracing::error!(topic = %self.topic.id, error = %e, "Failed to mark topic complete");
+                    return false;
+                }
+                let cost = self.total_cost().await;
+                progress::topic_done(&self.topic.id, cost);
+                true
             }
-            false
-        } else {
-            let cost = self.total_cost().await;
-            progress::topic_done(&self.topic.id, cost);
-            true
+            Ok(PipelineOutcome::NeedsReview(reason)) => {
+                if let Err(e) = self.queue_manager.lock().await.mark_needs_review(&self.topic, &reason) {
+                    tracing::error!(topic = %self.topic.id, error = %e, "Failed to mark topic as needs_review");
+                    return false;
+                }
+                let cost = self.total_cost().await;
+                progress::topic_needs_review(&self.topic.id, &reason, cost);
+                // Pipeline reached a clean terminal state. Return true so the worker
+                // pool counts this as "not errored"; the needs_review state is recorded
+                // in meta.yaml and the topic is out of the queue regardless.
+                true
+            }
+            Err(e) => {
+                tracing::error!(topic = %self.topic.id, error = %e, "Pipeline failed");
+                progress::topic_failed(&self.topic.id, &e.to_string());
+                if let Err(write_err) = self.queue_manager.lock().await.fail_topic(&self.topic, &e.to_string()) {
+                    tracing::error!(topic = %self.topic.id, error = %write_err, "Failed to record topic failure in queue");
+                }
+                false
+            }
         }
     }
 
@@ -93,7 +200,7 @@ impl TopicPipeline {
             .unwrap_or(0.0)
     }
 
-    async fn run_inner(&self) -> Result<()> {
+    async fn run_inner(&self) -> Result<PipelineOutcome> {
         self.setup_directories()?;
         self.queue_manager.lock().await.claim_topic(&self.topic)?;
 
@@ -115,10 +222,13 @@ impl TopicPipeline {
         progress::phase(&self.topic.id, "Validating...");
         self.queue_manager.lock().await.update_status(&self.topic, TopicStatus::Validating)?;
         let (validators_passed, validators_total) = self.run_validation_phase().await?;
-        if validators_passed == 0 && validators_total > 0 {
+        // Contract: require at least 2 of 4 validators to succeed. Running triage on
+        // a single validator's findings produces low-quality action lists and makes
+        // the downstream FIX/REJECT/DEFER signal meaningless.
+        if validators_total > 0 && validators_passed < 2 {
             anyhow::bail!(
-                "Validation phase failed (0/{} validators succeeded)",
-                validators_total
+                "Validation phase failed ({}/{} validators succeeded, need at least 2)",
+                validators_passed, validators_total
             );
         }
         if validators_passed < validators_total {
@@ -126,25 +236,36 @@ impl TopicPipeline {
                 topic = %self.topic.id,
                 passed = validators_passed,
                 total = validators_total,
-                "Some validators failed, proceeding to revision with partial validation"
+                "Some validators failed, proceeding with partial validation"
             );
         }
 
         self.check_cost_limit().await?;
 
+        progress::phase(&self.topic.id, "Triaging...");
+        self.queue_manager.lock().await.update_status(&self.topic, TopicStatus::Triaging)?;
+        self.run_triage_phase().await?;
+        self.check_cost_limit().await?;
+
         progress::phase(&self.topic.id, "Revising...");
         self.queue_manager.lock().await.update_status(&self.topic, TopicStatus::Revising)?;
         self.run_revision_phase().await?;
+        self.check_cost_limit().await?;
 
-        self.queue_manager.lock().await.complete_topic(&self.topic)?;
-        Ok(())
+        progress::phase(&self.topic.id, "Verifying...");
+        self.queue_manager.lock().await.update_status(&self.topic, TopicStatus::Verifying)?;
+        self.run_verify_phase().await?;
+
+        // Verify phase produced verify.md; parse its frontmatter to decide the outcome.
+        // complete_topic / mark_needs_review is called by `run()`, not here.
+        Ok(parse_verify_report(&self.topic_dir.join("verify.md")))
     }
 
     fn setup_directories(&self) -> Result<()> {
         std::fs::create_dir_all(&self.research_dir)?;
-        std::fs::create_dir_all(&self.topic_dir.join("sources"))?;
+        std::fs::create_dir_all(self.topic_dir.join("sources"))?;
         std::fs::create_dir_all(&self.validation_dir)?;
-        std::fs::create_dir_all(&self.responses_dir())?;
+        std::fs::create_dir_all(self.responses_dir())?;
         Ok(())
     }
 
@@ -164,6 +285,7 @@ impl TopicPipeline {
     async fn run_research_phase(&self) -> Result<bool> {
         let mut already_done = 0;
         let mut agent_names = Vec::new();
+        let mut agent_output_paths: Vec<PathBuf> = Vec::new();
         let mut agent_futures = Vec::new();
 
         for def in roster::RESEARCH_AGENTS {
@@ -182,9 +304,10 @@ impl TopicPipeline {
             let prompt_template = agent::load_prompt(&self.prompts_dir(), def.prompt_file)?;
             let prompt = prompt_template.replace("{topic}", &self.topic.input);
             let agent_config = AgentConfig::new(
-                name, &self.config, prompt, output_path, def.allowed_tools,
+                name, &self.config, prompt, output_path.clone(), def.allowed_tools,
             );
             agent_names.push(name);
+            agent_output_paths.push(output_path);
             agent_futures.push(self.runner.run_agent(agent_config));
         }
 
@@ -196,7 +319,7 @@ impl TopicPipeline {
         heartbeat.stop();
 
         let mut newly_succeeded = 0;
-        for (name, result) in agent_names.iter().zip(results) {
+        for ((name, output_path), result) in agent_names.iter().zip(agent_output_paths.iter()).zip(results) {
             let mut qm = self.queue_manager.lock().await;
             match result {
                 Ok(result) => {
@@ -207,7 +330,11 @@ impl TopicPipeline {
                         &self.topic, name, agent_status, result.duration_seconds,
                         result.error.as_deref(), result.usage.as_ref(),
                     )?;
-                    if result.success { newly_succeeded += 1; }
+                    if result.success {
+                        newly_succeeded += 1;
+                        drop(qm);
+                        mark_output_complete(output_path);
+                    }
                 }
                 Err(e) => {
                     progress::agent_error(name, &e.to_string());
@@ -236,7 +363,7 @@ impl TopicPipeline {
             .replace("{research_dir}", &self.research_dir.to_string_lossy());
 
         let agent_config = AgentConfig::new(
-            "synthesizer", &self.config, prompt, output_path, roster::SYNTHESIS_TOOLS,
+            "synthesizer", &self.config, prompt, output_path.clone(), roster::SYNTHESIS_TOOLS,
         );
 
         progress::agents_starting(&["synthesizer"]);
@@ -253,6 +380,10 @@ impl TopicPipeline {
             result.error.as_deref(), result.usage.as_ref(),
         )?;
 
+        if result.success {
+            mark_output_complete(&output_path);
+        }
+
         Ok(result.success)
     }
 
@@ -265,6 +396,7 @@ impl TopicPipeline {
         let total = roster::VALIDATION_AGENTS.len();
         let mut succeeded = 0;
         let mut agent_names = Vec::new();
+        let mut agent_output_paths: Vec<PathBuf> = Vec::new();
         let mut agent_futures = Vec::new();
 
         for def in roster::VALIDATION_AGENTS {
@@ -281,16 +413,19 @@ impl TopicPipeline {
             }
 
             let prompt_template = agent::load_prompt(&self.prompts_dir(), def.prompt_file)?;
+            let max_web_tool_calls = self.config.max_web_tool_calls_for(name).to_string();
             let prompt = prompt_template
                 .replace("{topic}", &self.topic.input)
                 .replace("{synthesis_path}", &synthesis_str)
                 .replace("{research_dir}", &research_str)
-                .replace("{validation_dir}", &validation_str);
+                .replace("{validation_dir}", &validation_str)
+                .replace("{max_web_tool_calls}", &max_web_tool_calls);
 
             let agent_config = AgentConfig::new(
-                name, &self.config, prompt, output_path, def.allowed_tools,
+                name, &self.config, prompt, output_path.clone(), def.allowed_tools,
             );
             agent_names.push(name);
+            agent_output_paths.push(output_path);
             agent_futures.push(self.runner.run_agent(agent_config));
         }
 
@@ -301,7 +436,7 @@ impl TopicPipeline {
         let results = join_all(agent_futures).await;
         heartbeat.stop();
 
-        for (name, result) in agent_names.iter().zip(results) {
+        for ((name, output_path), result) in agent_names.iter().zip(agent_output_paths.iter()).zip(results) {
             let mut qm = self.queue_manager.lock().await;
             match result {
                 Ok(result) => {
@@ -312,7 +447,11 @@ impl TopicPipeline {
                         &self.topic, name, agent_status, result.duration_seconds,
                         result.error.as_deref(), result.usage.as_ref(),
                     )?;
-                    if result.success { succeeded += 1; }
+                    if result.success {
+                        succeeded += 1;
+                        drop(qm);
+                        mark_output_complete(output_path);
+                    }
                 }
                 Err(e) => {
                     progress::agent_error(name, &e.to_string());
@@ -326,6 +465,45 @@ impl TopicPipeline {
         Ok((succeeded, total))
     }
 
+    async fn run_triage_phase(&self) -> Result<()> {
+        let output_path = self.topic_dir.join("triage.md");
+
+        if agent_output_exists(&output_path) {
+            progress::agent_cached("triage");
+            self.queue_manager.lock().await.record_agent_result(&self.topic, "triage", AgentStatus::DoneCached, 0.0, None, None)?;
+            return Ok(());
+        }
+
+        let prompt_template = agent::load_prompt(&self.prompts_dir(), roster::TRIAGE_PROMPT)?;
+        let prompt = prompt_template
+            .replace("{validation_dir}", &self.validation_dir.to_string_lossy());
+
+        let agent_config = AgentConfig::new(
+            "triage", &self.config, prompt, output_path.clone(), roster::TRIAGE_TOOLS,
+        );
+
+        progress::agents_starting(&["triage"]);
+        let heartbeat = progress::start_heartbeat(30);
+        let result = self.runner.run_agent(agent_config).await?;
+        heartbeat.stop();
+
+        progress::agent_done("triage", &result);
+        self.save_raw_response("triage", &result);
+
+        let agent_status = if result.success { AgentStatus::Done } else { AgentStatus::Failed };
+        self.queue_manager.lock().await.record_agent_result(
+            &self.topic, "triage", agent_status, result.duration_seconds,
+            result.error.as_deref(), result.usage.as_ref(),
+        )?;
+
+        if !result.success {
+            anyhow::bail!("Triage phase failed");
+        }
+
+        mark_output_complete(&output_path);
+        Ok(())
+    }
+
     async fn run_revision_phase(&self) -> Result<()> {
         let output_path = self.topic_dir.join("overview_final.md");
 
@@ -337,12 +515,12 @@ impl TopicPipeline {
 
         let prompt_template = agent::load_prompt(&self.prompts_dir(), roster::REVISION_PROMPT)?;
         let prompt = prompt_template
-            .replace("{topic}", &self.topic.input)
             .replace("{synthesis_path}", &self.topic_dir.join("overview.md").to_string_lossy())
-            .replace("{validation_dir}", &self.validation_dir.to_string_lossy());
+            .replace("{triage_path}", &self.topic_dir.join("triage.md").to_string_lossy())
+            .replace("{final_path}", &output_path.to_string_lossy());
 
         let agent_config = AgentConfig::new(
-            "revision", &self.config, prompt, output_path, roster::REVISION_TOOLS,
+            "revision", &self.config, prompt, output_path.clone(), roster::REVISION_TOOLS,
         );
 
         progress::agents_starting(&["revision"]);
@@ -363,6 +541,47 @@ impl TopicPipeline {
             anyhow::bail!("Revision phase failed");
         }
 
+        mark_output_complete(&output_path);
+        Ok(())
+    }
+
+    async fn run_verify_phase(&self) -> Result<()> {
+        let output_path = self.topic_dir.join("verify.md");
+
+        if agent_output_exists(&output_path) {
+            progress::agent_cached("verify");
+            self.queue_manager.lock().await.record_agent_result(&self.topic, "verify", AgentStatus::DoneCached, 0.0, None, None)?;
+            return Ok(());
+        }
+
+        let prompt_template = agent::load_prompt(&self.prompts_dir(), roster::VERIFY_PROMPT)?;
+        let prompt = prompt_template
+            .replace("{final_path}", &self.topic_dir.join("overview_final.md").to_string_lossy())
+            .replace("{triage_path}", &self.topic_dir.join("triage.md").to_string_lossy());
+
+        let agent_config = AgentConfig::new(
+            "verify", &self.config, prompt, output_path.clone(), roster::VERIFY_TOOLS,
+        );
+
+        progress::agents_starting(&["verify"]);
+        let heartbeat = progress::start_heartbeat(30);
+        let result = self.runner.run_agent(agent_config).await?;
+        heartbeat.stop();
+
+        progress::agent_done("verify", &result);
+        self.save_raw_response("verify", &result);
+
+        let agent_status = if result.success { AgentStatus::Done } else { AgentStatus::Failed };
+        self.queue_manager.lock().await.record_agent_result(
+            &self.topic, "verify", agent_status, result.duration_seconds,
+            result.error.as_deref(), result.usage.as_ref(),
+        )?;
+
+        if !result.success {
+            anyhow::bail!("Verify phase failed");
+        }
+
+        mark_output_complete(&output_path);
         Ok(())
     }
 }
@@ -457,6 +676,16 @@ mod tests {
 
     // --- agent_output_exists ---
 
+    /// Test helper: write content and the completion sidecar together, simulating
+    /// what a successful agent run produces.
+    fn write_cached(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+        std::fs::write(sidecar_path(path), "").unwrap();
+    }
+
     #[test]
     fn agent_output_exists_false_for_missing_file() {
         assert!(!agent_output_exists(Path::new("/tmp/definitely-not-a-real-file-xyz.md")));
@@ -471,11 +700,43 @@ mod tests {
     }
 
     #[test]
-    fn agent_output_exists_true_for_file_with_content() {
+    fn agent_output_exists_false_without_sidecar() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("research.md");
-        std::fs::write(&path, "# Findings\nSome content here").unwrap();
+        // Content but no `.done` sidecar — simulates a partial write.
+        std::fs::write(&path, "# Partial findings — crashed mid-stream").unwrap();
+        assert!(
+            !agent_output_exists(&path),
+            "content without sidecar must not be treated as cached"
+        );
+    }
+
+    #[test]
+    fn agent_output_exists_true_with_content_and_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("research.md");
+        write_cached(&path, "# Findings\nSome content here");
         assert!(agent_output_exists(&path));
+    }
+
+    #[test]
+    fn agent_output_exists_false_with_only_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("research.md");
+        std::fs::write(sidecar_path(&path), "").unwrap();
+        // Sidecar exists but no content file at all.
+        assert!(
+            !agent_output_exists(&path),
+            "sidecar without content must not be treated as cached"
+        );
+    }
+
+    #[test]
+    fn sidecar_path_appends_done_extension() {
+        assert_eq!(
+            sidecar_path(Path::new("/tmp/research/academic.md")),
+            PathBuf::from("/tmp/research/academic.md.done")
+        );
     }
 
     // --- Fake runners for pipeline tests ---
@@ -512,7 +773,8 @@ mod tests {
                     if let Some(parent) = config.output_path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    std::fs::write(&config.output_path, format!("# {} output\nFake content for testing", config.name))?;
+                    let content = fake_output_for(&config.name);
+                    std::fs::write(&config.output_path, content)?;
                 }
                 Ok(AgentResult {
                     success,
@@ -523,6 +785,50 @@ mod tests {
                 })
             })
         }
+    }
+
+    /// Content the fake runners write for each agent. Most agents get generic placeholder
+    /// content; the verify agent gets a valid passing YAML frontmatter so the pipeline's
+    /// frontmatter parser reads it as `overall: pass`. Tests that want NeedsReview or
+    /// failing verify behavior use the dedicated verdict runners below.
+    fn fake_output_for(name: &str) -> String {
+        if name == "verify" {
+            fake_verify_passing()
+        } else {
+            format!("# {name} output\nFake content for testing")
+        }
+    }
+
+    fn fake_verify_passing() -> String {
+        "---\n\
+         overall: pass\n\
+         needs_human_review: false\n\
+         failed_checks: []\n\
+         ---\n\
+         \n\
+         # Verification Report\n\
+         \n\
+         ## Overall: PASS\n\
+         All fake checks pass.\n".to_string()
+    }
+
+    fn fake_verify_failing() -> String {
+        "---\n\
+         overall: fail\n\
+         needs_human_review: true\n\
+         failed_checks:\n\
+           - fix_application\n\
+           - origin_tags\n\
+         ---\n\
+         \n\
+         # Verification Report\n\
+         \n\
+         ## Overall: FAIL\n\
+         Fake failing verify report.\n".to_string()
+    }
+
+    fn fake_verify_no_frontmatter() -> String {
+        "# Verification Report\n\nNo frontmatter at all.\n".to_string()
     }
 
     /// Fails only the agents whose names are in `failing_names`. Everyone else succeeds.
@@ -558,12 +864,62 @@ mod tests {
                     if let Some(parent) = config.output_path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    std::fs::write(&config.output_path, format!("# {} output\nFake content", config.name))?;
+                    std::fs::write(&config.output_path, fake_output_for(&config.name))?;
                 }
                 Ok(AgentResult {
                     success,
                     duration_seconds: 1.0,
                     error: if should_fail { Some(format!("{} failed", config.name)) } else { None },
+                    usage: None,
+                    raw_response: None,
+                })
+            })
+        }
+    }
+
+    /// A runner that succeeds every agent but overrides the verify agent's output with
+    /// a specific file content. Used to test the NeedsReview path without having to
+    /// thread verdict logic through FakeRunner.
+    struct FakeRunnerWithVerifyContent {
+        invocation_count: AtomicUsize,
+        verify_content: String,
+    }
+
+    impl FakeRunnerWithVerifyContent {
+        fn new(verify_content: String) -> Self {
+            Self {
+                invocation_count: AtomicUsize::new(0),
+                verify_content,
+            }
+        }
+
+        fn invocations(&self) -> usize {
+            self.invocation_count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl AgentRunner for FakeRunnerWithVerifyContent {
+        fn run_agent(
+            &self,
+            config: AgentConfig,
+        ) -> Pin<Box<dyn Future<Output = Result<AgentResult>> + Send + '_>> {
+            self.invocation_count.fetch_add(1, Ordering::SeqCst);
+            let verify_content = self.verify_content.clone();
+
+            Box::pin(async move {
+                if let Some(parent) = config.output_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let content = if config.name == "verify" {
+                    verify_content
+                } else {
+                    fake_output_for(&config.name)
+                };
+                std::fs::write(&config.output_path, content)?;
+                Ok(AgentResult {
+                    success: true,
+                    duration_seconds: 1.0,
+                    error: None,
                     usage: None,
                     raw_response: None,
                 })
@@ -631,6 +987,200 @@ mod tests {
         (results, qm_after)
     }
 
+    // --- Verify frontmatter parsing ---
+
+    #[test]
+    fn extract_yaml_frontmatter_basic() {
+        let content = "---\noverall: pass\n---\n\n# Body\n";
+        assert_eq!(extract_yaml_frontmatter(content), Some("overall: pass"));
+    }
+
+    #[test]
+    fn extract_yaml_frontmatter_multiline() {
+        let content = "---\noverall: fail\nfailed_checks:\n  - a\n  - b\n---\n\nbody";
+        assert_eq!(
+            extract_yaml_frontmatter(content),
+            Some("overall: fail\nfailed_checks:\n  - a\n  - b")
+        );
+    }
+
+    #[test]
+    fn extract_yaml_frontmatter_missing_opening() {
+        let content = "# Just a markdown file\nNo frontmatter here.";
+        assert_eq!(extract_yaml_frontmatter(content), None);
+    }
+
+    #[test]
+    fn extract_yaml_frontmatter_missing_closing() {
+        let content = "---\noverall: pass\nno closing marker";
+        assert_eq!(extract_yaml_frontmatter(content), None);
+    }
+
+    #[test]
+    fn parse_verify_report_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verify.md");
+        std::fs::write(&path, fake_verify_passing()).unwrap();
+        match parse_verify_report(&path) {
+            PipelineOutcome::Done => {}
+            PipelineOutcome::NeedsReview(r) => panic!("expected Done, got NeedsReview({r})"),
+        }
+    }
+
+    #[test]
+    fn parse_verify_report_fail_lists_failed_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verify.md");
+        std::fs::write(&path, fake_verify_failing()).unwrap();
+        match parse_verify_report(&path) {
+            PipelineOutcome::NeedsReview(r) => {
+                assert!(r.contains("fix_application"), "reason should include failed check: {r}");
+                assert!(r.contains("origin_tags"), "reason should include failed check: {r}");
+            }
+            PipelineOutcome::Done => panic!("expected NeedsReview, got Done"),
+        }
+    }
+
+    #[test]
+    fn parse_verify_report_missing_frontmatter_is_needs_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verify.md");
+        std::fs::write(&path, fake_verify_no_frontmatter()).unwrap();
+        match parse_verify_report(&path) {
+            PipelineOutcome::NeedsReview(r) => {
+                assert!(r.contains("frontmatter"), "reason should mention frontmatter: {r}");
+            }
+            PipelineOutcome::Done => panic!("missing frontmatter must fail to NeedsReview"),
+        }
+    }
+
+    #[test]
+    fn parse_verify_report_malformed_yaml_is_needs_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verify.md");
+        std::fs::write(
+            &path,
+            "---\n{{{{not valid yaml at all\n---\n\nbody",
+        ).unwrap();
+        match parse_verify_report(&path) {
+            PipelineOutcome::NeedsReview(r) => {
+                assert!(r.contains("malformed") || r.contains("frontmatter"),
+                        "reason should flag malformed: {r}");
+            }
+            PipelineOutcome::Done => panic!("malformed yaml must fail to NeedsReview"),
+        }
+    }
+
+    #[test]
+    fn parse_verify_report_missing_file_is_needs_review() {
+        match parse_verify_report(Path::new("/tmp/definitely-not-a-real-verify-file.md")) {
+            PipelineOutcome::NeedsReview(_) => {}
+            PipelineOutcome::Done => panic!("missing file must fail to NeedsReview"),
+        }
+    }
+
+    // --- Pipeline outcome tests ---
+
+    #[tokio::test]
+    async fn pipeline_marks_needs_review_when_verify_fails() {
+        let (_dir, queue_path, output_dir, prompts_dir) = setup_pipeline_test();
+        let runner: Arc<dyn AgentRunner> = Arc::new(
+            FakeRunnerWithVerifyContent::new(fake_verify_failing()),
+        );
+
+        make_qm(&queue_path, &output_dir).add_topic("test-topic", "Test topic").unwrap();
+        let (results, qm) = run_pipeline(&queue_path, &output_dir, &prompts_dir, runner).await;
+
+        assert!(results[0].1, "pipeline should return true (clean terminal state)");
+
+        let meta = qm.read_meta(&make_topic("test-topic", "")).unwrap();
+        assert_eq!(meta.status, TopicStatus::NeedsReview);
+        assert!(meta.completed_at.is_some());
+        let err = meta.error.as_ref().expect("needs_review should set error field");
+        assert!(err.contains("fix_application"), "error should name failed check: {err}");
+
+        // Topic should be out of the queue (mark_needs_review removes it)
+        assert!(qm.get_pending_topics().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pipeline_marks_needs_review_when_verify_frontmatter_missing() {
+        let (_dir, queue_path, output_dir, prompts_dir) = setup_pipeline_test();
+        let runner: Arc<dyn AgentRunner> = Arc::new(
+            FakeRunnerWithVerifyContent::new(fake_verify_no_frontmatter()),
+        );
+
+        make_qm(&queue_path, &output_dir).add_topic("test-topic", "Test topic").unwrap();
+        let (results, qm) = run_pipeline(&queue_path, &output_dir, &prompts_dir, runner).await;
+
+        assert!(results[0].1, "pipeline should return true (clean terminal state)");
+
+        let meta = qm.read_meta(&make_topic("test-topic", "")).unwrap();
+        assert_eq!(
+            meta.status,
+            TopicStatus::NeedsReview,
+            "missing frontmatter must become NeedsReview, not Done or Failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn needs_review_topic_is_picked_up_by_recover() {
+        let (_dir, queue_path, output_dir, prompts_dir) = setup_pipeline_test();
+        let runner: Arc<dyn AgentRunner> = Arc::new(
+            FakeRunnerWithVerifyContent::new(fake_verify_failing()),
+        );
+
+        make_qm(&queue_path, &output_dir).add_topic("test-topic", "Test topic").unwrap();
+        run_pipeline(&queue_path, &output_dir, &prompts_dir, runner).await;
+
+        // Topic is in NeedsReview state and out of the queue.
+        let mut qm = make_qm(&queue_path, &output_dir);
+        assert!(qm.get_pending_topics().unwrap().is_empty());
+        let meta = qm.read_meta(&make_topic("test-topic", "")).unwrap();
+        assert_eq!(meta.status, TopicStatus::NeedsReview);
+
+        // recover_failed should pick it up and reset to Pending.
+        let recovered = qm.recover_failed().unwrap();
+        assert_eq!(recovered, vec!["test-topic".to_string()]);
+        assert_eq!(qm.get_pending_topics().unwrap().len(), 1);
+        let meta_after = qm.read_meta(&make_topic("test-topic", "")).unwrap();
+        assert_eq!(meta_after.status, TopicStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn partial_write_without_sidecar_is_rerun_not_cached() {
+        // Simulate a partial write: content present, no sidecar. The pipeline must
+        // re-run the research agent rather than treating the fragment as cached.
+        let (_dir, queue_path, output_dir, prompts_dir) = setup_pipeline_test();
+        let runner = Arc::new(FakeRunner::succeeding());
+
+        make_qm(&queue_path, &output_dir).add_topic("test-topic", "Test topic").unwrap();
+
+        let research_dir = output_dir.join("test-topic/research");
+        std::fs::create_dir_all(&research_dir).unwrap();
+        // Write a "partial" academic.md: content, no sidecar.
+        std::fs::write(
+            research_dir.join("academic.md"),
+            "# Partial findings — agent timed out mid-write",
+        ).unwrap();
+
+        let (results, qm) = run_pipeline(&queue_path, &output_dir, &prompts_dir, runner.clone()).await;
+
+        assert!(results[0].1, "pipeline should succeed");
+        // All 11 agents run because no output has a sidecar.
+        assert_eq!(runner.invocations(), 11);
+
+        // The partial file was overwritten by the fresh run; now it has a sidecar too.
+        assert!(sidecar_path(&research_dir.join("academic.md")).exists());
+
+        let meta = qm.read_meta(&make_topic("test-topic", "")).unwrap();
+        assert_eq!(
+            meta.agents["research_academic"].status,
+            AgentStatus::Done,
+            "partial-write file should trigger a fresh run, not count as cached"
+        );
+    }
+
     #[tokio::test]
     async fn full_pipeline_succeeds_with_fake_runner() {
         let (_dir, queue_path, output_dir, prompts_dir) = setup_pipeline_test();
@@ -642,7 +1192,8 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert!(results[0].1, "pipeline should succeed");
-        assert_eq!(runner.invocations(), 9);
+        // 3 research + 1 synthesis + 4 validation + 1 triage + 1 revision + 1 verify = 11
+        assert_eq!(runner.invocations(), 11);
         assert!(qm.get_pending_topics().unwrap().is_empty());
 
         let meta = qm.read_meta(&make_topic("test-topic", "")).unwrap();
@@ -654,7 +1205,9 @@ mod tests {
         assert!(output_dir.join("test-topic/research/general.md").exists());
         assert!(output_dir.join("test-topic/overview.md").exists());
         assert!(output_dir.join("test-topic/validation/bias.md").exists());
+        assert!(output_dir.join("test-topic/triage.md").exists());
         assert!(output_dir.join("test-topic/overview_final.md").exists());
+        assert!(output_dir.join("test-topic/verify.md").exists());
     }
 
     #[tokio::test]
@@ -666,13 +1219,14 @@ mod tests {
 
         let research_dir = output_dir.join("test-topic/research");
         std::fs::create_dir_all(&research_dir).unwrap();
-        std::fs::write(research_dir.join("academic.md"), "# Cached academic findings").unwrap();
-        std::fs::write(research_dir.join("expert.md"), "# Cached expert findings").unwrap();
+        write_cached(&research_dir.join("academic.md"), "# Cached academic findings");
+        write_cached(&research_dir.join("expert.md"), "# Cached expert findings");
 
         let (results, qm) = run_pipeline(&queue_path, &output_dir, &prompts_dir, runner.clone()).await;
 
         assert!(results[0].1, "pipeline should succeed");
-        assert_eq!(runner.invocations(), 7);
+        // 1 research (2 cached) + 1 synthesis + 4 validation + 1 triage + 1 revision + 1 verify = 9
+        assert_eq!(runner.invocations(), 9);
 
         let meta = qm.read_meta(&make_topic("test-topic", "")).unwrap();
         assert_eq!(meta.agents["research_academic"].status, AgentStatus::DoneCached);
@@ -695,13 +1249,17 @@ mod tests {
         std::fs::create_dir_all(topic_dir.join("sources")).unwrap();
 
         for f in &["academic.md", "expert.md", "general.md"] {
-            std::fs::write(research_dir.join(f), "cached").unwrap();
+            write_cached(&research_dir.join(f), "cached");
         }
-        std::fs::write(topic_dir.join("overview.md"), "cached synthesis").unwrap();
+        write_cached(&topic_dir.join("overview.md"), "cached synthesis");
         for f in &["bias.md", "sources.md", "claims.md", "completeness.md"] {
-            std::fs::write(validation_dir.join(f), "cached").unwrap();
+            write_cached(&validation_dir.join(f), "cached");
         }
-        std::fs::write(topic_dir.join("overview_final.md"), "cached").unwrap();
+        write_cached(&topic_dir.join("triage.md"), "cached triage");
+        write_cached(&topic_dir.join("overview_final.md"), "cached");
+        // Cached verify.md must have a valid passing frontmatter so the parser reads
+        // it as a pass and the topic is marked Done, not NeedsReview.
+        write_cached(&topic_dir.join("verify.md"), &fake_verify_passing());
 
         let (results, _qm) = run_pipeline(&queue_path, &output_dir, &prompts_dir, runner.clone()).await;
 
@@ -734,8 +1292,7 @@ mod tests {
         make_qm(&queue_path, &output_dir).add_topic("test-topic", "Test topic").unwrap();
 
         let research_dir = output_dir.join("test-topic/research");
-        std::fs::create_dir_all(&research_dir).unwrap();
-        std::fs::write(research_dir.join("academic.md"), "# Cached findings").unwrap();
+        write_cached(&research_dir.join("academic.md"), "# Cached findings");
 
         let (results, qm) = run_pipeline(&queue_path, &output_dir, &prompts_dir, runner.clone()).await;
 
@@ -763,7 +1320,8 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results[0].1);
         assert!(results[1].1);
-        assert_eq!(runner.invocations(), 18);
+        // 2 topics * 11 agents each
+        assert_eq!(runner.invocations(), 22);
         assert!(qm.get_pending_topics().unwrap().is_empty());
     }
 
@@ -800,8 +1358,8 @@ mod tests {
         let runner = Arc::new(FakeRunner::succeeding());
         let (results, _qm) = run_pipeline(&queue_path, &output_dir, &prompts_dir, runner.clone()).await;
         assert!(results[0].1);
-        // 0 research (all cached) + 1 synthesis + 4 validation + 1 revision = 6
-        assert_eq!(runner.invocations(), 6);
+        // 0 research (all cached) + 1 synthesis + 4 validation + 1 triage + 1 revision + 1 verify = 8
+        assert_eq!(runner.invocations(), 8);
     }
 
     // --- Selective failure tests ---
@@ -840,18 +1398,39 @@ mod tests {
 
     #[tokio::test]
     async fn partial_validator_failure_still_completes() {
+        // 2 of 4 validators succeed — exactly at the new threshold. Pipeline proceeds.
         let (_dir, queue_path, output_dir, prompts_dir) = setup_pipeline_test();
         let runner: Arc<dyn AgentRunner> = Arc::new(SelectiveFakeRunner::failing_agents(&["validate_bias", "validate_sources"]));
 
         make_qm(&queue_path, &output_dir).add_topic("test-topic", "Test topic").unwrap();
         let (results, qm) = run_pipeline(&queue_path, &output_dir, &prompts_dir, runner).await;
 
-        assert!(results[0].1, "pipeline should succeed with partial validation");
+        assert!(results[0].1, "pipeline should succeed with 2-of-4 validators passing");
 
         let meta = qm.read_meta(&make_topic("test-topic", "")).unwrap();
         assert_eq!(meta.status, TopicStatus::Done);
         assert_eq!(meta.agents["validate_bias"].status, AgentStatus::Failed);
         assert_eq!(meta.agents["validate_claims"].status, AgentStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn only_one_validator_passing_fails_pipeline() {
+        // 1 of 4 validators succeeds — below the threshold. Pipeline bails at validation.
+        let (_dir, queue_path, output_dir, prompts_dir) = setup_pipeline_test();
+        let runner: Arc<dyn AgentRunner> = Arc::new(SelectiveFakeRunner::failing_agents(&[
+            "validate_bias", "validate_sources", "validate_claims",
+        ]));
+
+        make_qm(&queue_path, &output_dir).add_topic("test-topic", "Test topic").unwrap();
+        let (results, qm) = run_pipeline(&queue_path, &output_dir, &prompts_dir, runner).await;
+
+        assert!(!results[0].1, "pipeline should fail with 1-of-4 validators passing");
+
+        let meta = qm.read_meta(&make_topic("test-topic", "")).unwrap();
+        assert_eq!(meta.status, TopicStatus::Failed);
+        let err = meta.error.as_ref().expect("should record error");
+        assert!(err.contains("Validation phase failed"), "error should cite validation: {err}");
+        assert!(err.contains("1/4"), "error should report pass count: {err}");
     }
 
     #[tokio::test]

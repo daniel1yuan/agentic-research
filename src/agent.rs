@@ -146,13 +146,13 @@ fn is_transient_error(stdout: &str) -> bool {
 async fn invoke_claude(config: AgentConfig) -> Result<AgentResult> {
     let start = Instant::now();
 
+    // The wrapper's only job is to inject the output path (which the prompt file
+    // cannot know at authoring time). The prompt itself already tells the agent to
+    // use the Write tool and not print findings as text — we do not need to repeat
+    // those instructions. Single trailing line keeps the reminder at the recency end
+    // of the context where it has the most effect.
     let full_prompt = format!(
-        "IMPORTANT: You MUST save your complete output by using the Write tool to write to the file: {path}\n\
-         Do NOT print your findings as text — use the Write tool to save them to that exact path.\n\n\
-         ---\n\n\
-         {prompt}\n\n\
-         ---\n\n\
-         Reminder: use the Write tool to save your complete output to: {path}",
+        "{prompt}\n\n---\nWrite your complete output to {path} using the Write tool.",
         path = config.output_path.display(),
         prompt = config.prompt,
     );
@@ -529,6 +529,7 @@ mod tests {
             model: Some("opus".to_string()),
             max_turns: Some(50),
             timeout: Some(1200),
+            max_web_tool_calls: None,
         });
 
         let config = Config {

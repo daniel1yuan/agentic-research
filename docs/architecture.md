@@ -6,7 +6,7 @@ We want to deeply research a queue of topics without supervision. A single LLM p
 
 ## High-level design
 
-The system is a CLI that processes a queue of topics through a multi-agent pipeline. Each topic goes through four phases, and the output is a directory of structured markdown files with cited sources.
+The system is a CLI that processes a queue of topics through a multi-agent pipeline. Each topic goes through six phases, and the output is a directory of structured markdown files with cited sources.
 
 ```
 queue.yaml -> [pipeline per topic] -> output/{topic-id}/
@@ -18,11 +18,17 @@ The pipeline per topic:
 research (3 agents, parallel)
     -> synthesis (1 agent)
     -> validation (4 agents, parallel)
+    -> triage (1 agent)
     -> revision (1 agent)
+    -> verify (1 agent)
     -> done
 ```
 
-9 agent invocations per topic. Each agent is a `claude -p` subprocess with a specific prompt, model, and tool set.
+11 agent invocations per topic. Each agent is a `claude -p` subprocess with a specific prompt, model, and tool set.
+
+Each phase has exactly one job, and each phase's output format is a hard contract that the next phase trusts. The data contracts — what each phase consumes, what it produces, what structure is required — are specified in [`pipeline-contracts.md`](pipeline-contracts.md). That document is the source of truth; prompts and code enforce it.
+
+The shape of the pipeline is deliberate: validation produces critique, triage merges and prioritizes, revision applies fixes mechanically, verify checks the fixes landed. Separating these jobs prevents the failure mode where a single "revision" agent conflates triage with application and silently drops findings.
 
 ## Module breakdown
 
@@ -50,7 +56,7 @@ The agent invocation layer. Three things here:
 
 1. **`AgentRunner` trait** - The injectable interface. Takes an `AgentConfig`, returns an `AgentResult`. The pipeline calls this, never `claude` directly.
 2. **`ClaudeRunner`** - Production implementation. Builds a `claude -p` command with the config's model, max turns, allowed tools, and timeout. Parses usage/cost from the JSON response. Falls back to extracting output from stdout if the agent doesn't write its output file.
-3. **`AgentConfig` constructors** - `research()`, `synthesis()`, `validator()`, `revision()`. Each sets the appropriate tool list for that agent type (research gets WebSearch, synthesis doesn't, etc.).
+3. **`AgentConfig` constructors** - `research()`, `synthesis()`, `validator()`, `triage()`, `revision()`, `verify()`. Each sets the appropriate tool list for that agent type (research gets WebSearch, triage/revision get Read+Write only, verify gets Read only, etc.).
 
 `AgentResult` carries: success/failure, duration, error message, `AgentUsage` (tokens + cost), and the raw JSON response.
 
@@ -73,7 +79,7 @@ Key operations:
 ### `pipeline.rs` (844 lines, ~400 are tests)
 The per-topic pipeline and the cross-topic worker pool.
 
-**`TopicPipeline`**: Runs the four phases for a single topic. Holds `Arc<Config>`, `Arc<dyn AgentRunner>`, and `Arc<Mutex<QueueManager>>`. Each phase:
+**`TopicPipeline`**: Runs the six phases for a single topic. Holds `Arc<Config>`, `Arc<dyn AgentRunner>`, and `Arc<Mutex<QueueManager>>`. Each phase:
 
 1. Checks if output files already exist (resume logic)
 2. Loads prompt from disk, substitutes `{topic}`, `{research_dir}`, etc.
@@ -82,27 +88,27 @@ The per-topic pipeline and the cross-topic worker pool.
 5. Records results to meta.yaml
 6. Saves raw JSON response to `responses/`
 
-Research and validation phases use `futures::future::join_all` to run agents concurrently. Synthesis and revision are sequential (they depend on prior phase output).
+Research and validation phases use `futures::future::join_all` to run agents concurrently. Synthesis, triage, revision, and verify are sequential (each depends on the prior phase's output).
 
 Cost guardrail: `check_cost_limit()` runs between each phase. Reads cumulative cost from meta.yaml and bails if it exceeds `max_cost_per_topic`.
 
 **`WorkerPool`**: Owns `Arc<Config>` and the output directory. Spawns one `tokio::spawn` task per topic, bounded by a semaphore (`max_concurrent_topics`). Each task creates a `TopicPipeline` and runs it.
 
-### `roster.rs` (35 lines)
+### `roster.rs`
 Single source of truth for the agent definitions:
 
 - `RESEARCH_AGENTS`: 3 entries (academic, expert, general)
 - `VALIDATION_AGENTS`: 4 entries (bias, sources, claims, completeness)
-- `SYNTHESIS_PROMPT`, `REVISION_PROMPT`: Filenames
-- `all_prompt_files()`: Returns all 9 prompt filenames (used by preflight and tests)
+- `SYNTHESIS_PROMPT`, `TRIAGE_PROMPT`, `REVISION_PROMPT`, `VERIFY_PROMPT`: Filenames
+- `all_prompt_files()`: Returns all 11 prompt filenames (used by preflight and tests)
 
 Each `AgentDef` has: name, prompt file, output file, needs_web flag.
 
-### `preflight.rs` (100 lines)
-Pre-run validation. Checks: claude CLI installed, auth works (quick test invocation), config valid, queue parseable, no duplicate IDs, all 9 prompt files exist, output dir writable. Suggests `init` if prompts are missing.
+### `preflight.rs`
+Pre-run validation. Checks: claude CLI installed, auth works (quick test invocation), config valid, queue parseable, no duplicate IDs, all 11 prompt files exist, output dir writable. Suggests `init` if prompts are missing.
 
-### `init.rs` (94 lines)
-Project scaffolding. All 9 prompts are embedded in the binary via `include_str!`. `init` extracts them to a `prompts/` directory, creates `config.yaml` with documented defaults, `queue.yaml`, and `output/`. Skips existing files unless `--force` is passed.
+### `init.rs`
+Project scaffolding. All 11 prompts are embedded in the binary via `include_str!`. `init` extracts them to a `prompts/` directory, creates `config.yaml` with documented defaults, `queue.yaml`, and `output/`. Skips existing files unless `--force` is passed.
 
 ## Data flow
 
@@ -125,13 +131,23 @@ Project scaffolding. All 9 prompts are embedded in the binary via `include_str!`
    - Check cost limit
 7. Validation phase:
    - Same pattern: skip cached, run uncached in parallel
-   - Count successes. If 0/4, bail. If partial, warn and continue.
+   - Count successes. If <2/4 succeed, bail. 2 or 3 is a warning.
    - Check cost limit
-8. Revision phase:
-   - Check if overview_final.md exists (skip if cached)
-   - Run revision agent
+8. Triage phase:
+   - Check if triage.md exists (skip if cached)
+   - Run triage agent on the 4 validator reports
+   - Must account for every validator finding (action list + discarded)
    - If failed, bail
-9. complete_topic(): status -> "done", remove from queue.yaml
+9. Revision phase:
+   - Check if overview_final.md exists (skip if cached)
+   - Run revision agent on overview.md + triage.md (NOT validator reports)
+   - If failed, bail
+10. Verify phase:
+    - Check if verify.md exists (skip if cached)
+    - Run verify agent (Haiku, mechanical checks only)
+    - On PASS: complete_topic()
+    - On FAIL: mark topic `needs_human_review: true` in meta.yaml, do NOT auto-retry
+11. complete_topic(): status -> "done", remove from queue.yaml
 ```
 
 If any phase bails, `fail_topic()` records the error in meta.yaml and removes from queue. `recover` is the only way to re-queue.
@@ -140,18 +156,20 @@ If any phase bails, `fail_topic()` records the error in meta.yaml and removes fr
 
 ```
 output/{topic-id}/
-  meta.yaml               # state: status, timestamps, per-agent results with tokens/cost
-  overview.md              # synthesis output (first pass)
-  overview_final.md        # revised synthesis (after validation)
+  meta.yaml                # state: status, timestamps, per-agent results, needs_human_review flag
+  overview.md              # synthesis output
+  triage.md                # triage action list
+  overview_final.md        # revised synthesis + ledger
+  verify.md                # verifier report
   research/
-    academic.md            # academic research agent output
-    expert.md              # expert research agent output
-    general.md             # general discourse agent output
+    academic.md
+    expert.md
+    general.md
   validation/
-    bias.md                # bias validation report
-    sources.md             # source verification report
-    claims.md              # claim cross-reference report
-    completeness.md        # coverage gap report
+    bias.md
+    sources.md
+    claims.md
+    completeness.md
   responses/               # raw JSON from each claude invocation
     research_academic.json
     research_expert.json
@@ -161,9 +179,13 @@ output/{topic-id}/
     validate_sources.json
     validate_claims.json
     validate_completeness.json
+    triage.json
     revision.json
+    verify.json
   sources/                 # reserved for future per-source files
 ```
+
+See [`pipeline-contracts.md`](pipeline-contracts.md) for the format of each file.
 
 ## Key design decisions
 

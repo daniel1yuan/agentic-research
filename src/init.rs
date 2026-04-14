@@ -10,7 +10,9 @@ const PROMPTS: &[(&str, &str)] = &[
     ("validate_sources.md", include_str!("../prompts/validate_sources.md")),
     ("validate_claims.md", include_str!("../prompts/validate_claims.md")),
     ("validate_completeness.md", include_str!("../prompts/validate_completeness.md")),
+    ("triage.md", include_str!("../prompts/triage.md")),
     ("revise.md", include_str!("../prompts/revise.md")),
+    ("verify.md", include_str!("../prompts/verify.md")),
 ];
 
 const DEFAULT_CONFIG: &str = "\
@@ -27,7 +29,7 @@ cli_env: {}
 max_concurrent_topics: 2
 
 # Default timeout per agent invocation in seconds
-agent_timeout: 600
+agent_timeout: 3600
 
 # Default claude model for all agents
 # Aliases: opus, sonnet, haiku. Full names also work (e.g., claude-sonnet-4-6).
@@ -45,20 +47,33 @@ output_dir: \"output\"
 # Queue file path (relative to project root)
 queue_file: \"queue.yaml\"
 
-# Per-agent overrides. Synthesis and revision benefit from a stronger model
-# since they need to reason across multiple sources.
+# Per-agent overrides. Each agent supports:
+#   model, max_turns, timeout, max_web_tool_calls
+# Unset fields fall back to the global defaults above.
+#
+# The pipeline has 11 agents across 6 phases. Synthesis and triage are the
+# hardest reasoning; validate_completeness and verify are mechanical and can
+# run on Haiku. validate_sources has a tighter timeout and a web tool cap
+# because it fetches external sources.
 agents:
   synthesizer:
     model: \"opus\"
-  revision:
+  validate_sources:
+    max_turns: 35
+    timeout: 900
+    max_web_tool_calls: 25
+  validate_completeness:
+    model: \"haiku\"
+  triage:
     model: \"opus\"
+  verify:
+    model: \"haiku\"
 
 # All agent names for reference:
 #   research_academic, research_expert, research_general,
-#   synthesizer, validate_bias, validate_sources,
-#   validate_claims, validate_completeness, revision
-#
-# Each supports: model, max_turns, timeout
+#   synthesizer,
+#   validate_bias, validate_sources, validate_claims, validate_completeness,
+#   triage, revision, verify
 ";
 
 const DEFAULT_QUEUE: &str = "topics: []\n";

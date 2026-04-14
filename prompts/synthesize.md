@@ -86,11 +86,30 @@ Research layers will sometimes disagree. Academic sources may contradict expert 
 - Don't hide conflict behind vague language like "views vary" or "more research is needed." Be specific about what varies and what research would resolve it.
 - If one position has substantially stronger evidence, say so. If the disagreement is genuinely unresolved, say that too.
 
+## Claim traceability (required)
+
+Every factual claim in your synthesis must carry an inline origin tag so a downstream auditor can trace it back to its basis. Tags come **immediately after the citation** and use exactly one of these four values:
+
+- `[academic]` — the claim is directly stated in `research/academic.md`
+- `[expert]` — the claim is directly stated in `research/expert.md`
+- `[general]` — the claim is directly stated in `research/general.md`
+- `[inference: <one-line rationale>]` — the claim is *your* synthesis move (combining, extrapolating, or contextualizing what the research files say). The rationale must name what you combined or extrapolated from.
+
+Examples:
+- `Meta-analyses find a ~0.5 kg advantage for high-volume training [Smith 2022] [academic].`
+- `Practitioners commonly report plateaus around the 12-week mark [Felix blog] [expert].`
+- `The 1993 factor model does not itself test dividend policy; the dividend-irrelevance application is Felix's [inference: Fama & French 1993 provides the factor framework; Felix applies it to dividends in his 2019 video].`
+
+Rules:
+- If a claim cannot be tagged with one of the three source tags, it **must** be tagged `[inference: ...]` or removed. "Reasonable inference" without a tag is hallucination.
+- Do not tag sub-clauses; tag whole sentences or clearly-bounded claims.
+- The Executive Summary and Source Summary Table are exempt from per-sentence tagging, but every claim in the summary must be supported by a tagged claim elsewhere in the document.
+
 ## Critical guidelines
 
 - **Be genuinely unbiased.** Don't softpedal one side or give false balance. If the evidence strongly supports one position, say so, but also explain why some disagree.
-- **Cite everything.** Every factual claim should reference a specific source from the research files. Use the format: [Author/Source, Year] or [Source Title].
+- **Cite everything with an origin tag.** Every factual claim needs both a `[Author/Source, Year]` citation *and* an origin tag from the four above. Missing either is a defect.
 - **Distinguish evidence quality.** "A meta-analysis of 50 RCTs found X" is different from "a blog post argues X." Make the difference visible using the tier system above.
 - **Don't flatten complexity.** If the answer is "it depends," explain what it depends on.
-- **Flag your own uncertainty.** If the research is thin on a particular point, say so rather than overstating what we know.
+- **Flag your own uncertainty.** If the research is thin on a particular point, say so rather than overstating what we know. Use `[inference: ...]` when you are reasoning beyond what the files directly say — don't hide inference as fact.
 - **Write for a curious, intelligent reader** who wants to actually understand the topic, not just get a summary.

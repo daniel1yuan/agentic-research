@@ -20,14 +20,20 @@ pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<()> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum TopicStatus {
     Pending,
     Researching,
     Synthesizing,
     Validating,
+    Triaging,
     Revising,
+    Verifying,
     Done,
+    /// Verifier flagged the final document for human review. The pipeline completed
+    /// cleanly but the verifier's mechanical checks found issues. Treat as a terminal
+    /// state like Failed — the topic is removed from the queue, and `recover` re-queues it.
+    NeedsReview,
     Failed,
     #[default]
     Unknown,
@@ -40,8 +46,11 @@ impl std::fmt::Display for TopicStatus {
             Self::Researching => "researching",
             Self::Synthesizing => "synthesizing",
             Self::Validating => "validating",
+            Self::Triaging => "triaging",
             Self::Revising => "revising",
+            Self::Verifying => "verifying",
             Self::Done => "done",
+            Self::NeedsReview => "needs_review",
             Self::Failed => "failed",
             Self::Unknown => "unknown",
         };
@@ -249,9 +258,10 @@ impl QueueManager {
             let meta: TopicMeta = serde_yaml::from_str(&contents)?;
 
             if matches!(meta.status,
-                TopicStatus::Failed | TopicStatus::Researching
-                | TopicStatus::Synthesizing | TopicStatus::Validating
-                | TopicStatus::Revising
+                TopicStatus::Failed | TopicStatus::NeedsReview
+                | TopicStatus::Researching | TopicStatus::Synthesizing
+                | TopicStatus::Validating | TopicStatus::Triaging
+                | TopicStatus::Revising | TopicStatus::Verifying
             ) {
                 // reset meta to allow resume
                 let reset_meta = TopicMeta {
@@ -336,13 +346,39 @@ impl QueueManager {
         Ok(())
     }
 
+    /// Mark a topic as requiring human review. This is a terminal state used when
+    /// the verifier flagged the final document as failing one or more mechanical
+    /// checks. The pipeline completed cleanly — the topic is not "failed" — but
+    /// the output needs human attention before it can be considered done. Like
+    /// `fail_topic`, this removes the topic from the queue so it does not auto-retry.
+    /// `recover` will re-queue it along with failed topics.
+    pub fn mark_needs_review(&mut self, topic: &Topic, reason: &str) -> Result<()> {
+        let mut meta = self.read_meta(topic)?;
+        meta.status = TopicStatus::NeedsReview;
+        meta.error = Some(reason.to_string());
+        // NeedsReview is terminal; record completion time like Done/Failed do.
+        if meta.completed_at.is_none() {
+            meta.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        }
+        self.write_meta(topic, &meta)?;
+        self.with_queue_lock_mut(|queue| {
+            queue.topics.retain(|t| t.id != topic.id);
+            Ok(())
+        })?;
+        tracing::warn!(topic_id = %topic.id, reason, "Topic needs human review");
+        Ok(())
+    }
+
     pub fn is_already_processed(&self, topic: &Topic) -> bool {
         let meta_path = self.meta_path(topic);
         if !meta_path.exists() {
             return false;
         }
         self.read_meta(topic)
-            .map(|m| matches!(m.status, TopicStatus::Done | TopicStatus::Failed))
+            .map(|m| matches!(
+                m.status,
+                TopicStatus::Done | TopicStatus::Failed | TopicStatus::NeedsReview
+            ))
             .unwrap_or(false)
     }
 
@@ -448,9 +484,10 @@ impl QueueManager {
 
                 match meta.status {
                     TopicStatus::Done => done.push(meta),
-                    TopicStatus::Failed => failed.push(meta),
+                    TopicStatus::Failed | TopicStatus::NeedsReview => failed.push(meta),
                     TopicStatus::Researching | TopicStatus::Synthesizing
-                    | TopicStatus::Validating | TopicStatus::Revising => {
+                    | TopicStatus::Validating | TopicStatus::Triaging
+                    | TopicStatus::Revising | TopicStatus::Verifying => {
                         in_progress.push(meta);
                     }
                     TopicStatus::Pending | TopicStatus::Unknown => {}

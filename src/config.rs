@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 pub const DEFAULT_MAX_TURNS: u32 = 25;
+pub const DEFAULT_MAX_WEB_TOOL_CALLS: u32 = 25;
 pub const CONNECTIVITY_TIMEOUT_SECS: u64 = 30;
 const TOPIC_PREVIEW_LEN: usize = 80;
 const SLUG_MAX_LEN: usize = 50;
@@ -75,6 +76,10 @@ pub struct AgentOverride {
     pub model: Option<String>,
     pub max_turns: Option<u32>,
     pub timeout: Option<u64>,
+    /// Combined cap on WebSearch + WebFetch calls for this agent. Only meaningful for
+    /// agents whose prompt substitutes the `{max_web_tool_calls}` placeholder (today,
+    /// just `validate_sources`). Unset means the global default applies.
+    pub max_web_tool_calls: Option<u32>,
 }
 
 impl Config {
@@ -99,6 +104,13 @@ impl Config {
             .unwrap_or(self.agent_timeout)
     }
 
+    /// Resolve the effective web tool call cap for a given agent name.
+    /// This is the combined WebSearch + WebFetch budget.
+    pub fn max_web_tool_calls_for(&self, agent_name: &str) -> u32 {
+        self.agents.get(agent_name)
+            .and_then(|o| o.max_web_tool_calls)
+            .unwrap_or(DEFAULT_MAX_WEB_TOOL_CALLS)
+    }
 }
 
 fn default_cli_command() -> String { "claude".to_string() }
