@@ -211,7 +211,7 @@ Sections 1-7 are prose. Section 8 is a markdown table with columns: `Source | Ty
 
 - Validators are **read-only auditors**. The prompt must not contain words like "fix", "edit", "correct", "rewrite" — only "identify", "flag", "report".
 - `validate_sources` may use `WebSearch` and `WebFetch`, capped at `max_web_tool_calls` combined calls per run. This is a **configurable per-agent limit** in `config.yaml` (default 25). The cap is a hard budget, not a sample size — the validator must prioritize rather than randomly sample. See the Per-validator focus section below for prioritization criteria.
-- `validate_sources` runs with a tighter `timeout` than the global default (recommended 900s / 15 min) so a hang fails fast instead of burning the full 3600s budget. The root cause of prior hangs (muscle-hypertrophy topic) is unknown; the timeout is a mitigation.
+- `validate_sources` runs with a tighter `timeout` than the global default (recommended 900s / 15 min) so a hang fails fast instead of burning the full 3600s budget. The root cause of prior hangs on a long-running topic is unknown; the timeout is a mitigation.
 - `validate_sources` receives `max_turns: 35` by recommendation — higher than the 25 default — because prioritization logic plus web tool calls needs more room.
 - No other validator has web tool access. `validate_claims`, `validate_bias`, and `validate_completeness` get `Read` + `Grep` only.
 - If a validator cannot produce a finding in the required format, it should produce zero findings rather than a malformed one. Downstream phases will mark missing validators as a topic-level failure.

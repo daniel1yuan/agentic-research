@@ -36,7 +36,7 @@ This creates:
 my-research/
   config.yaml       # settings (model, timeout, concurrency)
   queue.yaml         # topic inbox
-  prompts/           # 9 agent prompt files (editable)
+  prompts/           # 11 agent prompt files (editable)
   output/            # research results land here
 ```
 
@@ -61,7 +61,7 @@ agentic-research run
 
 ## How it works
 
-Each topic goes through a four-phase pipeline:
+Each topic goes through a six-phase pipeline:
 
 1. **Research** (3 agents in parallel)
    - Academic: papers, systematic reviews, meta-analyses
@@ -79,11 +79,19 @@ Each topic goes through a four-phase pipeline:
    - Claim validation: are the key claims supported by the evidence?
    - Completeness: are there obvious gaps, missing perspectives, or underrepresented stakeholders?
 
-4. **Revision** (1 agent)
-   - Reads all validation reports and produces a final revised synthesis
+4. **Triage** (1 agent)
+   - Reads all four validator reports, merges and prioritizes findings
+   - Emits a single structured action list for the revision agent
+
+5. **Revision** (1 agent)
+   - Reads the triage action list and produces a final revised synthesis
    - Addresses major issues, adds caveats, fills gaps where possible
 
-Total: 9 agent invocations per topic (3 + 1 + 4 + 1).
+6. **Verify** (1 agent)
+   - Mechanical pass/fail checks against the revised synthesis
+   - Validates structure, citation tags, section format, document length
+
+Total: 11 agent invocations per topic (3 + 1 + 4 + 1 + 1 + 1).
 
 ## Source credibility tiers
 
